@@ -158,7 +158,19 @@ SESSION_SECRET=dev-secret-change-in-prod
 SSO_HOST=sso.int.test-gdcorp.tools
 ```
 
-- [ ] **Step 6: Verify dev server starts**
+- [ ] **Step 6: Create jest.config.js** (required for ESM tests)
+
+```js
+// jest.config.js
+export default {
+  testEnvironment: 'node',
+  transform: {},               // disable Babel — we're already ESM
+  moduleFileExtensions: ['js', 'jsx', 'mjs'],
+  testMatch: ['**/test/**/*.test.js']
+};
+```
+
+- [ ] **Step 7: Verify dev server starts**
 
 ```bash
 cp .env.local.example .env.local
@@ -168,7 +180,7 @@ npm run local
 
 Expected: Next.js compiles, server starts on port 3000.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git init && git add .
@@ -190,16 +202,16 @@ git commit -m "feat: initial Gasket 7 scaffold"
 // test/clients/switchboard.test.js
 import { jest } from '@jest/globals';
 
-jest.mock('@wsb/config-api-client', () => {
-  return jest.fn().mockImplementation(() => ({
-    get: jest.fn(),
-    put: jest.fn(),
-    getHistory: jest.fn()
-  }));
-});
-jest.mock('@wsb/core-config-rules', () => ({}));
+// ESM: use jest.unstable_mockModule + dynamic imports AFTER the mock.
+const ConfigClientMock = jest.fn().mockImplementation(() => ({
+  get: jest.fn(),
+  put: jest.fn(),
+  getHistory: jest.fn()
+}));
 
-// Set env before importing module under test
+jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
+jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
+
 process.env.SWITCHBOARD_CERT_PATH = '/fake/cert.crt';
 process.env.SWITCHBOARD_CERT_KEY_PATH = '/fake/cert.key';
 
@@ -211,25 +223,39 @@ test('getCdsClient returns same instance for same env', () => {
   expect(a).toBe(b);
 });
 
-test('getCdsAuthClient uses cds-auth app', async () => {
-  const ConfigClient = (await import('@wsb/config-api-client')).default;
+test('getCdsAuthClient uses cds-auth app', () => {
   getCdsAuthClient('dev');
-  expect(ConfigClient).toHaveBeenCalledWith(expect.objectContaining({ app: 'cds-auth' }));
+  expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({ app: 'cds-auth' }));
 });
 
-test('getCdsAdminClient uses cds-admin app', async () => {
-  const ConfigClient = (await import('@wsb/config-api-client')).default;
+test('getCdsAdminClient uses cds-admin app', () => {
   getCdsAdminClient('dev');
-  expect(ConfigClient).toHaveBeenCalledWith(expect.objectContaining({ app: 'cds-admin' }));
+  expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({ app: 'cds-admin' }));
 });
 
-test('throws when no auth env vars set', async () => {
+test('throws at first getClient call when no auth env vars set', async () => {
   delete process.env.SWITCHBOARD_CERT_PATH;
   delete process.env.SWITCHBOARD_CERT_KEY_PATH;
   delete process.env.SWITCHBOARD_IAM_CERT_PATH;
   delete process.env.SWITCHBOARD_JWT;
   jest.resetModules();
-  await expect(import('../../clients/switchboard.js')).rejects.toThrow('No Switchboard auth');
+  jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
+  jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
+  const mod = await import('../../clients/switchboard.js');
+  expect(() => mod.getCdsClient('dev')).toThrow('No Switchboard auth');
+});
+
+test('uses JWT via fetchOptions header when SWITCHBOARD_JWT set', async () => {
+  delete process.env.SWITCHBOARD_CERT_PATH;
+  process.env.SWITCHBOARD_JWT = 'jwt-token-xyz';
+  jest.resetModules();
+  jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
+  jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
+  const mod = await import('../../clients/switchboard.js');
+  mod.getCdsClient('dev');
+  expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({
+    fetchOptions: { headers: { Authorization: 'sso-jwt jwt-token-xyz' } }
+  }));
 });
 ```
 
@@ -250,23 +276,32 @@ const require = createRequire(import.meta.url);
 const ConfigClient = require('@wsb/config-api-client');
 const configRules = require('@wsb/core-config-rules');
 
-function buildAuth() {
+// Build auth config from env. Called lazily on first getClient() so the module
+// can be imported in contexts (SSR, tests) without auth vars set.
+function buildClientOptions() {
+  // IAM cert (Katana prod)
   if (process.env.SWITCHBOARD_IAM_CERT_PATH) {
-    return {
+    return { auth: {
       cert: [process.env.SWITCHBOARD_IAM_CERT_PATH],
       key: process.env.SWITCHBOARD_IAM_KEY_PATH
-    };
+    }};
   }
+  // Client cert (local dev Option A)
   if (process.env.SWITCHBOARD_CERT_PATH) {
-    return {
+    return { auth: {
       cert: [process.env.SWITCHBOARD_CERT_PATH],
       key: process.env.SWITCHBOARD_CERT_KEY_PATH
-    };
+    }};
   }
-  throw new Error('No Switchboard auth configured. Set SWITCHBOARD_IAM_CERT_PATH or SWITCHBOARD_CERT_PATH.');
+  // ssojwt bearer token (local dev Option B)
+  if (process.env.SWITCHBOARD_JWT) {
+    return { fetchOptions: {
+      headers: { Authorization: `sso-jwt ${process.env.SWITCHBOARD_JWT}` }
+    }};
+  }
+  throw new Error('No Switchboard auth configured. Set SWITCHBOARD_IAM_CERT_PATH, SWITCHBOARD_CERT_PATH, or SWITCHBOARD_JWT.');
 }
 
-const auth = buildAuth();
 const cache = {};
 
 function getClient(app, env) {
@@ -277,7 +312,7 @@ function getClient(app, env) {
       env: env === 'local' ? 'dev' : env,
       plugins: [configRules],
       cache: { path: null, tts: 30000 },
-      auth
+      ...buildClientOptions()
     });
   }
   return cache[key];
@@ -287,6 +322,8 @@ export const getCdsClient      = env => getClient('cds', env);
 export const getCdsAuthClient  = env => getClient('cds-auth', env);
 export const getCdsAdminClient = env => getClient('cds-admin', env);
 ```
+
+> **Note:** the `fetchOptions.headers.Authorization` approach for SWITCHBOARD_JWT assumes the underlying `@wsb/config-api-client` accepts a pre-built JWT via a Bearer-style header. If in practice it only accepts cert/key or IAM, this branch should be adjusted — the closest alternative is to use ssojwt's cert output as `SWITCHBOARD_CERT_PATH`.
 
 - [ ] **Step 4: Run test — expect PASS**
 
@@ -320,13 +357,16 @@ git commit -m "feat: switchboard client factory with cert/IAM auth"
 
 ---
 
-## Task 3: Auth Middleware + Auth Route
+## Task 3: Auth Middleware + Auth Route + Error Handler + CSRF
 
 **Files:**
 - Create: `middleware/require-jomax.js`
+- Create: `middleware/require-same-origin.js` (CSRF defense)
+- Create: `middleware/error-handler.js`
 - Create: `lib/allowlist.js`
 - Create: `routes/auth.js`
 - Create: `test/middleware/require-jomax.test.js`
+- Create: `test/middleware/require-same-origin.test.js`
 - Create: `test/lib/allowlist.test.js`
 
 - [ ] **Step 1: Write failing tests**
@@ -367,7 +407,7 @@ test('returns 401 when no jomax token', () => {
 // test/lib/allowlist.test.js
 import { jest } from '@jest/globals';
 
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsAuthClient: jest.fn(() => ({
     get: jest.fn().mockResolvedValue({ jomax: ['jroig', 'alice'] })
   }))
@@ -381,6 +421,40 @@ test('resolves when user is in jomax allowlist', async () => {
 
 test('throws 403 when user is not in allowlist', async () => {
   await expect(assertAllowlisted('componentA', 'bob', 'dev')).rejects.toMatchObject({ status: 403 });
+});
+```
+
+```js
+// test/middleware/require-same-origin.test.js
+import { jest } from '@jest/globals';
+import { requireSameOrigin } from '../../middleware/require-same-origin.js';
+
+process.env.HOSTNAME = 'cds-admin.int.test-gdcorp.tools';
+
+function mockReq(method, origin) {
+  return { method, headers: { origin } };
+}
+
+test('allows GET without Origin check', () => {
+  const next = jest.fn();
+  requireSameOrigin(mockReq('GET'), { status: jest.fn() }, next);
+  expect(next).toHaveBeenCalled();
+});
+
+test('allows POST with matching Origin', () => {
+  const req = mockReq('POST', 'https://cds-admin.int.test-gdcorp.tools');
+  const next = jest.fn();
+  requireSameOrigin(req, { status: jest.fn() }, next);
+  expect(next).toHaveBeenCalled();
+});
+
+test('rejects POST with mismatched Origin', () => {
+  const req = mockReq('POST', 'https://evil.example.com');
+  const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+  const next = jest.fn();
+  requireSameOrigin(req, res, next);
+  expect(res.status).toHaveBeenCalledWith(403);
+  expect(next).not.toHaveBeenCalled();
 });
 ```
 
@@ -422,7 +496,39 @@ export async function assertAllowlisted(componentName, accountName, env) {
 }
 ```
 
-- [ ] **Step 5: Create routes/auth.js**
+- [ ] **Step 5: Create middleware/require-same-origin.js** (CSRF defense)
+
+```js
+// middleware/require-same-origin.js
+// State-changing requests must come from our own origin.
+// Relies on SameSite cookies + Origin header check (adequate for internal tools).
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export function requireSameOrigin(req, res, next) {
+  if (SAFE_METHODS.has(req.method)) return next();
+  const origin = req.headers.origin || req.headers.referer;
+  const expected = `https://${process.env.HOSTNAME || 'cds-admin.int.test-gdcorp.tools'}`;
+  if (!origin || !origin.startsWith(expected)) {
+    return res.status(403).json({ error: 'Origin mismatch' });
+  }
+  next();
+}
+```
+
+- [ ] **Step 6: Create middleware/error-handler.js**
+
+```js
+// middleware/error-handler.js
+// Express final error handler — must be registered AFTER all routes.
+export function errorHandler(err, req, res, next) {
+  const status = err.status || 500;
+  // Don't leak stack traces in responses
+  console.error('[cds-admin error]', err);
+  res.status(status).json({ error: err.message || 'Internal server error' });
+}
+```
+
+- [ ] **Step 7: Create routes/auth.js**
 
 ```js
 // routes/auth.js
@@ -443,17 +549,38 @@ router.post('/auth/logout', (req, res) => {
 export default router;
 ```
 
-- [ ] **Step 6: Run tests — expect PASS**
+- [ ] **Step 8: Wire middleware in gasket.js**
 
-```bash
-npm test -- test/middleware/require-jomax.test.js test/lib/allowlist.test.js
+Add a plugin hook that registers `requireSameOrigin` globally and `errorHandler` as the final handler:
+
+```js
+// Add to gasket.js plugins array:
+{
+  name: 'cds-admin-global-middleware',
+  hooks: {
+    async middleware() {
+      const { requireSameOrigin } = await import('./middleware/require-same-origin.js');
+      return [requireSameOrigin];
+    },
+    async errorMiddleware() {
+      const { errorHandler } = await import('./middleware/error-handler.js');
+      return [errorHandler];
+    }
+  }
+}
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Run tests — expect PASS**
 
 ```bash
-git add middleware/ lib/ routes/auth.js test/middleware/ test/lib/
-git commit -m "feat: jomax auth middleware and allowlist check"
+npm test -- test/middleware test/lib
+```
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add middleware/ lib/ routes/auth.js test/middleware/ test/lib/ gasket.js
+git commit -m "feat: jomax auth, allowlist, csrf, error handler"
 ```
 
 ---
@@ -474,12 +601,12 @@ import request from 'supertest';
 import express from 'express';
 
 const mockGet = jest.fn();
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsClient: jest.fn(() => ({ get: mockGet, put: jest.fn() })),
   getCdsAuthClient: jest.fn(() => ({ put: jest.fn() })),
   getCdsAdminClient: jest.fn(() => ({ put: jest.fn() }))
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -844,26 +971,25 @@ npm test -- test/routes/components.test.js
 
 ```jsx
 // components/JsonEditor.js
-import dynamic from 'next/dynamic.js';
-import { useState, useCallback } from 'react';
+// Cleanly separates value-change from validation-change to avoid stale-closure bugs.
+// Parent passes `onChange` (value updates) and `onValidate` (valid/invalid flag) independently.
+import dynamic from 'next/dynamic';
+import { useState } from 'react';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
 
-export default function JsonEditor({ value, onChange, readOnly = false, height = '400px' }) {
-  const [isValid, setIsValid] = useState(true);
+export default function JsonEditor({ value, onChange, onValidate, readOnly = false, height = '400px' }) {
+  const [hasErrors, setHasErrors] = useState(false);
 
-  const handleValidation = useCallback(markers => {
-    setIsValid(markers.length === 0);
-    onChange?.(null, markers.length === 0);
-  }, [onChange]);
-
-  const handleChange = useCallback(val => {
-    onChange?.(val, isValid);
-  }, [onChange, isValid]);
+  function handleValidation(markers) {
+    const invalid = markers.length > 0;
+    setHasErrors(invalid);
+    onValidate?.(!invalid);
+  }
 
   return (
     <div>
-      {!isValid && (
+      {hasErrors && (
         <div style={{ background: '#fee', color: '#c00', padding: '4px 8px', fontSize: 12 }}>
           Invalid JSON — fix errors before saving
         </div>
@@ -872,7 +998,7 @@ export default function JsonEditor({ value, onChange, readOnly = false, height =
         height={height}
         defaultLanguage="json"
         value={typeof value === 'string' ? value : JSON.stringify(value, null, 2)}
-        onChange={handleChange}
+        onChange={onChange}
         onValidate={handleValidation}
         options={{ readOnly, minimap: { enabled: false }, scrollBeyondLastLine: false }}
       />
@@ -886,11 +1012,11 @@ export default function JsonEditor({ value, onChange, readOnly = false, height =
 ```jsx
 // pages/components/[name].js
 import { useState, useEffect } from 'react';
-import { useRouter } from 'next/router.js';
+import { useRouter } from 'next/router';
 import Layout from '../../components/Layout.js';
 import JsonEditor from '../../components/JsonEditor.js';
 
-const TABS = ['Manifest', 'History', 'Sync', 'i18n', 'RUM', 'Access', 'Alerts', 'Analytics'];
+const TABS = ['Manifest', 'History', 'Sync', 'i18n', 'RUM', 'Access', 'Alerts'];
 
 export default function ComponentDetail() {
   const router = useRouter();
@@ -925,11 +1051,6 @@ export default function ComponentDetail() {
     setSaveMsg(res.ok ? 'Saved' : 'Error saving');
   }
 
-  function handleEditorChange(val, valid) {
-    if (val !== null) setEditorValue(val);
-    setEditorValid(valid);
-  }
-
   return (
     <Layout env={env} onEnvChange={setEnv}>
       <div style={{ padding: 24 }}>
@@ -952,11 +1073,21 @@ export default function ComponentDetail() {
               {t}
             </button>
           ))}
+          <a
+            href={`/analytics?component=${name}`}
+            style={{ marginLeft: 'auto', padding: '8px 16px', color: '#0070d2' }}
+          >
+            Analytics →
+          </a>
         </div>
 
         {tab === 'Manifest' && (
           <div>
-            <JsonEditor value={editorValue} onChange={handleEditorChange} />
+            <JsonEditor
+              value={editorValue}
+              onChange={v => setEditorValue(v ?? '')}
+              onValidate={setEditorValid}
+            />
             <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
               <button onClick={handleSave} disabled={!editorValid || saving}>
                 {saving ? 'Saving…' : 'Save'}
@@ -965,7 +1096,7 @@ export default function ComponentDetail() {
             </div>
           </div>
         )}
-        {tab !== 'Manifest' && <p style={{ color: '#999' }}>{tab} — coming soon</p>}
+        {tab !== 'Manifest' && <p style={{ color: '#999' }}>{tab} — wired up in later tasks</p>}
       </div>
     </Layout>
   );
@@ -1151,9 +1282,11 @@ git commit -m "feat: history and rollback for manifests"
 Add to `test/routes/components.test.js`:
 
 ```js
-test('POST /api/components/:name/sync copies manifest across envs', async () => {
+test('POST /api/components/:name/sync copies manifest and checks allowlist on toEnv', async () => {
   const { getCdsAuthClient, getCdsClient } = await import('../../clients/switchboard.js');
-  getCdsAuthClient.mockReturnValue({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) });
+  // allowlist on toEnv must pass
+  const authGet = jest.fn().mockResolvedValue({ jomax: ['jroig'] });
+  getCdsAuthClient.mockReturnValue({ get: authGet });
   const srcManifest = { engine: 'esm', js: 'abc.es.js', dependencies: {} };
   const srcGet = jest.fn().mockResolvedValue(srcManifest);
   const dstPut = jest.fn().mockResolvedValue();
@@ -1166,8 +1299,21 @@ test('POST /api/components/:name/sync copies manifest across envs', async () => 
     .send({ fromEnv: 'prod', toEnv: 'test' });
 
   expect(res.status).toBe(200);
+  // Allowlist was checked on the destination env (test), not source (prod)
+  expect(getCdsAuthClient).toHaveBeenCalledWith('test');
   expect(srcGet).toHaveBeenCalledWith('registry.componentA');
   expect(dstPut).toHaveBeenCalledWith('registry.componentA', srcManifest);
+});
+
+test('POST /api/components/:name/sync returns 403 when user not allowlisted on toEnv', async () => {
+  const { getCdsAuthClient } = await import('../../clients/switchboard.js');
+  getCdsAuthClient.mockReturnValue({ get: jest.fn().mockResolvedValue({ jomax: ['alice'] }) });
+
+  const res = await request(app)
+    .post('/api/components/componentA/sync')
+    .send({ fromEnv: 'dev', toEnv: 'prod' });
+
+  expect(res.status).toBe(403);
 });
 ```
 
@@ -1180,7 +1326,9 @@ router.post('/api/components/:name/sync', requireJomax, async (req, res, next) =
   try {
     const { name } = req.params;
     const { fromEnv, toEnv } = req.body;
-    await assertAllowlisted(name, req.user.accountName, fromEnv);
+    // Check allowlist on the DESTINATION env — that's where the destructive write happens.
+    // A user with dev access must NOT be able to push to prod.
+    await assertAllowlisted(name, req.user.accountName, toEnv);
     const manifest = await getCdsClient(fromEnv).get(`registry.${name}`);
     await getCdsClient(toEnv).put(`registry.${name}`, manifest);
     res.json({ ok: true });
@@ -1279,11 +1427,11 @@ const mockGet = jest.fn();
 const mockPut = jest.fn();
 const mockGetHistory = jest.fn();
 
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsClient: jest.fn(() => ({ get: mockGet, put: mockPut, getHistory: mockGetHistory })),
   getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -1468,11 +1616,11 @@ import express from 'express';
 const mockGet = jest.fn();
 const mockPut = jest.fn();
 
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsClient: jest.fn(() => ({ get: mockGet, put: mockPut, getHistory: jest.fn().mockResolvedValue([]) })),
   getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -1590,10 +1738,10 @@ import express from 'express';
 const mockGet = jest.fn();
 const mockPut = jest.fn();
 
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsAuthClient: jest.fn(() => ({ get: mockGet, put: mockPut }))
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -1617,6 +1765,15 @@ test('PUT /api/access/:name updates jomax array', async () => {
     .send({ jomax: ['jroig', 'alice'] });
   expect(res.status).toBe(200);
   expect(mockPut).toHaveBeenCalledWith('componentA', { jomax: ['jroig', 'alice'], cert: [], awsiam: [] });
+});
+
+test('PUT /api/access/:name rejects empty jomax array (lockout prevention)', async () => {
+  mockGet.mockResolvedValue({ jomax: ['jroig'], cert: [], awsiam: [] });
+  const res = await request(app)
+    .put('/api/access/componentA?env=dev')
+    .send({ jomax: [] });
+  expect(res.status).toBe(400);
+  expect(mockPut).not.toHaveBeenCalled();
 });
 ```
 
@@ -1647,8 +1804,13 @@ router.put('/api/access/:name', requireJomax, async (req, res, next) => {
     const { name } = req.params;
     const env = req.query.env || 'dev';
     await assertAllowlisted(name, req.user.accountName, env);
+    const newJomax = Array.isArray(req.body.jomax) ? req.body.jomax : [];
+    // Never allow the allowlist to be emptied — that locks everyone out.
+    if (newJomax.length === 0) {
+      return res.status(400).json({ error: 'Allowlist cannot be empty (at least one jomax user required)' });
+    }
     const current = await getCdsAuthClient(env).get(name) ?? { jomax: [], cert: [], awsiam: [] };
-    const updated = { ...current, jomax: req.body.jomax };
+    const updated = { ...current, jomax: newJomax };
     await getCdsAuthClient(env).put(name, updated);
     res.json({ ok: true });
   } catch (err) {
@@ -1664,41 +1826,53 @@ export default router;
 
 ```jsx
 // components/AccessList.js
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 export default function AccessList({ componentName, env }) {
   const [entry, setEntry] = useState(null);
   const [newUser, setNewUser] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
-  useState(() => {
+  useEffect(() => {
     fetch(`/api/access/${componentName}?env=${env}`)
-      .then(r => r.json()).then(setEntry);
-  });
+      .then(r => r.json())
+      .then(setEntry);
+  }, [componentName, env]);
 
   async function save(newJomax) {
     setSaving(true);
-    await fetch(`/api/access/${componentName}?env=${env}`, {
+    setError('');
+    const res = await fetch(`/api/access/${componentName}?env=${env}`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jomax: newJomax })
     });
-    setEntry(e => ({ ...e, jomax: newJomax }));
     setSaving(false);
+    if (res.ok) {
+      setEntry(e => ({ ...e, jomax: newJomax }));
+    } else {
+      const body = await res.json();
+      setError(body.error || 'Failed to update');
+    }
   }
 
   if (!entry) return <p>Loading…</p>;
 
+  const canRemove = entry.jomax.length > 1;  // never remove the last user
+
   return (
     <div>
       <h3>Jomax Access</h3>
+      {error && <p style={{ color: 'red' }}>{error}</p>}
       <ul>
         {entry.jomax.map(user => (
           <li key={user} style={{ marginBottom: 4 }}>
             {user}
             <button
               onClick={() => save(entry.jomax.filter(u => u !== user))}
-              disabled={saving}
+              disabled={saving || !canRemove}
+              title={!canRemove ? 'Cannot remove the last user' : ''}
               style={{ marginLeft: 8, fontSize: 11 }}
             >
               Remove
@@ -1761,14 +1935,14 @@ import express from 'express';
 const mockGet = jest.fn();
 const mockPut = jest.fn();
 
-jest.mock('../../clients/switchboard.js', () => ({
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
   getCdsAdminClient: jest.fn(() => ({ get: mockGet, put: mockPut })),
   getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
 }));
-jest.mock('../../clients/slack.js', () => ({
+jest.unstable_mockModule('../../clients/slack.js', () => ({
   sendSlackMessage: jest.fn().mockResolvedValue()
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -1880,7 +2054,7 @@ git commit -m "feat: slack webhook alerts config"
 // test/clients/elasticsearch.test.js
 import { jest } from '@jest/globals';
 
-jest.mock('@elastic/elasticsearch', () => ({
+jest.unstable_mockModule('@elastic/elasticsearch', () => ({
   Client: jest.fn().mockImplementation(() => ({
     search: jest.fn().mockResolvedValue({ hits: { total: { value: 5 } }, aggregations: {} })
   }))
@@ -1969,6 +2143,14 @@ export async function queryErrors(componentName, from, to) {
 }
 
 export async function queryRequestVolume(componentName, from, to) {
+  // `componentTypes` can be a comma-separated list (e.g. componentTypes=foo,bar,baz).
+  // We match the component appearing in ANY position via regex on the keyword subfield.
+  // Examples that must match:
+  //   ...componentTypes=bamMediaManagerEsm
+  //   ...componentTypes=foo,bamMediaManagerEsm
+  //   ...componentTypes=foo,bamMediaManagerEsm&other=x
+  //   ...componentTypes=bamMediaManagerEsm,baz
+  const escaped = componentName.replace(/[.?+*|{}[\]()"\\]/g, '\\$&');
   return getEsClient().search({
     index: '.ds-cds-api-prod-logs-*',
     body: {
@@ -1977,7 +2159,7 @@ export async function queryRequestVolume(componentName, from, to) {
         bool: {
           must: [
             { term: { 'log.level': 'info' } },
-            { wildcard: { message: { value: `*componentTypes=${componentName}*` } } },
+            { regexp: { 'message.keyword': `.*componentTypes=([^&]*,)?${escaped}(,[^& ]*)?.*` } },
             { range: { '@timestamp': { gte: from, lte: to } } }
           ]
         }
@@ -2048,7 +2230,7 @@ import { jest } from '@jest/globals';
 import request from 'supertest';
 import express from 'express';
 
-jest.mock('../../clients/elasticsearch.js', () => ({
+jest.unstable_mockModule('../../clients/elasticsearch.js', () => ({
   queryErrors: jest.fn().mockResolvedValue({
     hits: { total: { value: 12 } },
     aggregations: { over_time: { buckets: [] } }
@@ -2060,7 +2242,7 @@ jest.mock('../../clients/elasticsearch.js', () => ({
     aggregations: { over_time: { buckets: [] } }
   })
 }));
-jest.mock('../../middleware/require-jomax.js', () => ({
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
 }));
 
@@ -2320,15 +2502,19 @@ git commit -m "feat: analytics dashboard with errors, volume, and web vitals"
 
 - [ ] **Step 1: Add connect-gd-auth middleware to gasket.js**
 
+`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register the middleware via a plugin hook. The hook must be `async` because Gasket 7's `middleware` lifecycle is async.
+
 ```js
-// In gasket.js plugins array, add a custom plugin after pluginExpress:
+// Add to the TOP of gasket.js (alongside other imports):
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const gdAuth = require('connect-gd-auth');
+
+// Add to the plugins array:
 {
   name: 'cds-admin-auth',
   hooks: {
-    middleware(gasket) {
-      const { createRequire } = await import('module');
-      const req = createRequire(import.meta.url);
-      const gdAuth = req('connect-gd-auth');
+    async middleware() {
       return [
         gdAuth({
           appName: 'cds-admin',
@@ -2347,20 +2533,33 @@ git commit -m "feat: analytics dashboard with errors, volume, and web vitals"
 
 ```jsx
 // pages/_app.js
-import { useEffect } from 'react';
+// Relies on connect-gd-auth's Origin-Location or Referer handling on the server.
+// When /auth/me returns 401, we just reload — the server-side auth middleware
+// will redirect the browser to SSO (connect-gd-auth handles the redirect URL).
+import { useEffect, useState } from 'react';
 
 export default function App({ Component, pageProps }) {
+  const [authed, setAuthed] = useState(null);
   useEffect(() => {
-    // Check session; if 401, redirect to SSO
     fetch('/auth/me').then(res => {
       if (res.status === 401) {
-        window.location.href = `https://${process.env.NEXT_PUBLIC_SSO_HOST}/v1/secure/auth?realm=jomax&app=cds-admin&path=${encodeURIComponent(window.location.pathname)}`;
+        // Let the server-side middleware redirect to SSO by reloading
+        window.location.reload();
+      } else {
+        setAuthed(true);
       }
     });
   }, []);
 
+  if (authed === null) return null;  // avoid flash of unauthenticated content
   return <Component {...pageProps} />;
 }
+```
+
+- [ ] **Step 2a: Also add `NEXT_PUBLIC_HOSTNAME` to `.env.local.example`**
+
+```bash
+NEXT_PUBLIC_HOSTNAME=cds-admin.int.test-gdcorp.tools
 ```
 
 - [ ] **Step 3: Verify auth gate in browser**
@@ -2395,3 +2594,23 @@ git commit -m "feat: connect-gd-auth SSO gate"
 - [ ] Analytics page — select component, charts render (errors, volume, vitals)
 - [ ] `npm test` — all tests pass
 - [ ] Deploy to Katana dev — IAM writes succeed without cert env vars
+
+---
+
+## Revision Notes
+
+**v2 fixes applied after review:**
+
+- **Jest ESM mocking** — `jest.mock()` replaced with `jest.unstable_mockModule()` (only working API under `--experimental-vm-modules`). Added `jest.config.js` creation to Task 1.
+- **Lazy Switchboard auth** — `buildClientOptions()` now called inside `getClient()` instead of at module load, so the module can be imported in SSR/test contexts without env vars set.
+- **SWITCHBOARD_JWT branch added** — uses `fetchOptions.headers.Authorization: sso-jwt <token>` (may need adjustment based on actual client acceptance).
+- **Sync allowlist check moved to `toEnv`** — prevents a user with only dev access from pushing to prod via sync.
+- **Last-user lockout prevented** — access route rejects PUT that would empty the jomax array; UI disables Remove when only one user remains.
+- **CSRF defense added** — `require-same-origin.js` middleware checks the `Origin`/`Referer` header on all state-changing requests.
+- **Central error handler added** — `middleware/error-handler.js` prevents stack-trace leaks.
+- **Connect-gd-auth middleware fixed** — `async middleware()` hook (was missing `async`); `createRequire` moved to top of `gasket.js`.
+- **JsonEditor stale closure fixed** — `onChange` (value) and `onValidate` (valid flag) are now separate props; no shared state mutation.
+- **AccessList useState → useEffect** — data fetch now uses proper effect hook with deps.
+- **Request volume ES query fixed** — now uses `message.keyword` regex that matches component name in any position within the `componentTypes=foo,bar,baz` list.
+- **Analytics decoupled from component detail** — removed as a tab; replaced with an `Analytics →` link to `/analytics?component={name}`.
+- **Next.js imports** — dropped `.js` extensions from `next/router`, `next/dynamic`.
