@@ -8,19 +8,18 @@ This tool is a web app for CDS component owners. It lives at `cds-admin.int.{env
 
 ## What it does
 
-**Component dashboard** — Every component gets one page showing all its data at once (no tabs). From here an engineer can:
-- View and edit the JSON manifest (Monaco editor with live JSON validation)
-- Edit the i18n version hash and RUM poller config (each with full change history and rollback)
-- Write plain-text notes that auto-save as they type
-- View the full Switchboard change history and roll back to any previous version
-- Copy the manifest across environments (dev → test → prod) with a single click
-- Manage the Jomax allowlist for the component (add/remove teammates; last-user removal is blocked)
-- Configure a Slack webhook for deployment alerts and send a test message
+**Component dashboard** — Every component gets a multi-page detail view with deep-linkable URLs per tab. The main page shows at-a-glance health; sub-pages for focused work:
+- **Main** (`/components/{name}`): RUM sparklines, error sparklines, plain-text notes textarea (auto-save)
+- **Manifest** (`/components/{name}/manifest`): Monaco JSON editor + history/rollback + i18n version hash + Slack webhook config
+- **Auth** (`/components/{name}/auth`): Jomax/cert/awsiam allowlist management with link to cds-auth docs
+- **RUM** (`/components/{name}/rum`): Full Web Vitals charts (LCP/CLS/INP p75) with deployment event markers (from `metaData.updatedAt`)
+- **Logs** (`/components/{name}/logs`): Error/log charts with log-level filter (error/warn/info/all; persisted in localStorage per component using key `cds-admin:logLevel:{name}`) plus deployment markers
+- **Sync** (`/components/{name}/sync`): Copy manifests across environments (dev/test/prod)
 
-**Component list** — Alphabetically sorted, case-insensitive search. Each user only sees components they have access to. Super-admins (managed via a Switchboard key, not the app) see everything.
+**Component list** — Alphabetically sorted, case-insensitive search. Shows `lastUpdated` (from `metaData.updatedAt`) per component. Each user only sees components they have access to. Super-admins (managed via a Switchboard key, not the app) see everything.
 
 **Analytics** — Pulls live data from two Elasticsearch clusters and renders it with Recharts:
-- *Logs cluster*: error rate over time, request volume
+- *Logs cluster*: error rate over time (filterable by log level), request volume
 - *RUM cluster*: Web Vitals p75 (LCP, CLS, INP)
 - Time range picker (1h / 6h / 24h / 7d)
 - "Open in Kibana →" deep-links that pre-filter the dashboard to the selected component
@@ -80,23 +79,32 @@ cds-admin/
 │   └── analytics.js                 # ES proxy: errors, volume, rum vitals
 ├── pages/
 │   ├── _app.js                      # Auth gate — redirects to SSO if no jomax session
-│   ├── index.js                     # Component list (filtered to user's access)
+│   ├── index.js                     # Component list (filtered to user's access; shows lastUpdated)
 │   ├── components/
 │   │   ├── new.js                   # Create component form
-│   │   └── [name].js                # Single-page dashboard — all sections visible at once
+│   │   └── [name]/
+│   │       ├── index.js             # Main: RUM sparklines + error sparklines + notes textarea
+│   │       ├── manifest.js          # Manifest editor + history/rollback + i18n + Slack alerts
+│   │       ├── auth.js              # cds-auth allowlist (jomax/cert/awsiam) + docs link
+│   │       ├── rum.js               # Full RUM charts with deployment event markers
+│   │       ├── logs.js              # Error/log charts + localStorage log-level filter + markers
+│   │       └── sync.js              # Environment sync panel (dev/test/prod copy)
+│   ├── docs/
+│   │   └── cds-auth.js              # Static: explains jomax/cert/awsiam auth types
 │   └── analytics.js                 # Full analytics page (time ranges, deeper dive)
 ├── components/
 │   ├── Layout.js                    # Shell: nav, env selector, user display
+│   ├── ComponentNav.js              # Tab bar shared across all /components/[name]/* pages
 │   ├── JsonEditor.js                # Monaco wrapper; emits onChange + onValidate
 │   ├── Notes.js                     # Plain-text notes textarea with debounced auto-save
 │   ├── HistoryTimeline.js           # List of history entries + Rollback button
 │   ├── SyncPanel.js                 # Env status badges + Copy env→env buttons
-│   ├── AccessList.js                # jomax list: add/remove usernames (last-user protected)
+│   ├── AccessList.js                # jomax/cert/awsiam allowlist editor; last-jomax-user protected
 │   └── charts/
 │       ├── ErrorsOverTime.js        # Recharts LineChart for error count
 │       ├── RequestVolume.js         # Recharts LineChart for request count
 │       ├── WebVitals.js             # Recharts LineChart for p75 LCP/CLS/INP
-│       └── MiniChart.js             # Compact single-metric sparkline for dashboard cards
+│       └── MiniChart.js             # Compact single-metric sparkline for main page
 └── test/
     ├── clients/
     │   ├── switchboard.test.js
@@ -112,7 +120,7 @@ cds-admin/
         ├── notes.test.js
         ├── access.test.js
         ├── alerts.test.js
-        └── analytics.test.js
+        └── analytics.test.js       # includes level filter tests
 ```
 
 ---
@@ -784,11 +792,11 @@ const app = express();
 app.use(express.json());
 app.use(router);
 
-test('GET /api/components returns only components the user is allowlisted on', async () => {
+test('GET /api/components returns only components the user is allowlisted on with lastUpdated', async () => {
   mockCdsGet.mockResolvedValue({
-    'registry.componentA': {},
-    'registry.componentB': {},
-    'registry.componentC': {},
+    'registry.componentA': { metaData: { updatedAt: '2026-01-01T00:00:00Z' } },
+    'registry.componentB': { metaData: { updatedAt: '2026-01-02T00:00:00Z' } },
+    'registry.componentC': { metaData: { updatedAt: null } },
     'registry.componentA.rum': {},        // sub-keys excluded
     'registry.componentA.i18nVersion': {}
   });
@@ -801,19 +809,25 @@ test('GET /api/components returns only components the user is allowlisted on', a
 
   const res = await request(app).get('/api/components');
   expect(res.status).toBe(200);
-  expect(res.body).toEqual(['componentA', 'componentC']);
+  expect(res.body).toEqual([
+    { name: 'componentA', lastUpdated: '2026-01-01T00:00:00Z' },
+    { name: 'componentC', lastUpdated: null }
+  ]);
 });
 
 test('GET /api/components returns ALL components for super admins', async () => {
   mockCdsGet.mockResolvedValue({
-    'registry.componentA': {},
-    'registry.componentB': {}
+    'registry.componentA': { metaData: { updatedAt: '2026-01-01T00:00:00Z' } },
+    'registry.componentB': { metaData: {} }
   });
   mockCdsAdminGet.mockResolvedValue({ jomax: ['jroig'] });  // super admin
 
   const res = await request(app).get('/api/components');
   expect(res.status).toBe(200);
-  expect(res.body).toEqual(['componentA', 'componentB']);
+  expect(res.body).toEqual([
+    { name: 'componentA', lastUpdated: '2026-01-01T00:00:00Z' },
+    { name: 'componentB', lastUpdated: null }
+  ]);
 });
 
 test('POST /api/components creates cds + cds-auth + cds-admin entries', async () => {
@@ -831,7 +845,7 @@ test('POST /api/components creates cds + cds-auth + cds-admin entries', async ()
 
   expect(res.status).toBe(201);
   expect(cdsClient.put).toHaveBeenCalledWith('registry.newComponent', expect.any(Object));
-  expect(authClient.put).toHaveBeenCalledWith('newComponent', { jomax: ['jroig'], cert: [], awsiam: [] });
+  expect(authClient.put).toHaveBeenCalledWith('newComponent', { jomax: [''], cert: [''], awsiam: [''] });
   expect(adminClient.put).toHaveBeenCalledWith('config.newComponent', { slackWebhookUrl: null });
 });
 ```
@@ -854,19 +868,25 @@ import { assertCanAccess, listAccessibleComponents } from '../lib/access-control
 const router = express.Router();
 
 // Strip sub-keys (.rum, .i18nVersion, .notes) — only top-level registry.* keys
-function extractComponentNames(allKeys) {
-  return Object.keys(allKeys)
-    .filter(k => k.startsWith('registry.') && k.split('.').length === 2)
-    .map(k => k.replace('registry.', ''));
+// Returns [{ name, lastUpdated }] sorted alphabetically
+function extractComponents(allKeys) {
+  return Object.entries(allKeys)
+    .filter(([k]) => k.startsWith('registry.') && k.split('.').length === 2)
+    .map(([k, v]) => ({
+      name: k.replace('registry.', ''),
+      lastUpdated: v?.metaData?.updatedAt ?? null
+    }));
 }
 
 router.get('/api/components', requireJomax, async (req, res, next) => {
   try {
     const env = req.query.env || 'dev';
     const all = await getCdsClient(env).get();
-    const allNames = extractComponentNames(all ?? {});
+    const allComponents = extractComponents(all ?? {});
+    const allNames = allComponents.map(c => c.name);
     // Filter to components the caller can access (super admins see all)
-    const accessible = await listAccessibleComponents(req.user.accountName, env, allNames);
+    const accessibleNames = await listAccessibleComponents(req.user.accountName, env, allNames);
+    const accessible = allComponents.filter(c => accessibleNames.includes(c.name));
     res.json(accessible);
   } catch (err) { next(err); }
 });
@@ -882,7 +902,7 @@ router.post('/api/components', requireJomax, async (req, res, next) => {
     }};
     await Promise.all([
       getCdsClient(env).put(`registry.${name}`, stub),
-      getCdsAuthClient(env).put(name, { jomax: [req.user.accountName], cert: [], awsiam: [] }),
+      getCdsAuthClient(env).put(name, { jomax: [''], cert: [''], awsiam: [''] }),
       getCdsAdminClient(env).put(`config.${name}`, { slackWebhookUrl: null })
     ]);
     res.status(201).json({ name });
@@ -902,10 +922,14 @@ npm test -- test/routes/components.test.js
 
 ```jsx
 // pages/index.js
-// Alphabetically sorted, case-insensitive search.
-// "co" matches "componentA", "COmponentB", "iCOn", etc. — anywhere in the name.
+// Alphabetically sorted, case-insensitive search. Shows lastUpdated per component.
 import { useState, useEffect, useMemo } from 'react';
 import Layout from '../components/Layout.js';
+
+function formatDate(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+}
 
 export default function ComponentList() {
   const [components, setComponents] = useState([]);
@@ -919,14 +943,14 @@ export default function ComponentList() {
   }, [env]);
 
   const sorted = useMemo(
-    () => [...components].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
+    () => [...components].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
     [components]
   );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sorted;
-    return sorted.filter(name => name.toLowerCase().includes(q));
+    return sorted.filter(({ name }) => name.toLowerCase().includes(q));
   }, [sorted, query]);
 
   return (
@@ -948,37 +972,36 @@ export default function ComponentList() {
           placeholder="Search components…"
           value={query}
           onChange={e => setQuery(e.target.value)}
-          style={{
-            width: '100%',
-            padding: '10px 14px',
-            fontSize: 16,
-            border: '1px solid #ccc',
-            borderRadius: 6,
-            marginBottom: 16
-          }}
+          style={{ width: '100%', padding: '10px 14px', fontSize: 16, border: '1px solid #ccc', borderRadius: 6, marginBottom: 16 }}
         />
 
         <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
           {filtered.length} of {sorted.length} components
         </div>
 
-        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-          {filtered.map(name => (
-            <li key={name} style={{ borderBottom: '1px solid #eee' }}>
-              <a
-                href={`/components/${name}`}
-                style={{ display: 'block', padding: '10px 8px', color: '#0070d2', textDecoration: 'none' }}
-              >
-                {name}
-              </a>
-            </li>
-          ))}
-          {filtered.length === 0 && (
-            <li style={{ padding: 16, color: '#999', textAlign: 'center' }}>
-              No components match "{query}"
-            </li>
-          )}
-        </ul>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ textAlign: 'left', borderBottom: '2px solid #eee', fontSize: 12, color: '#666' }}>
+              <th style={{ padding: '6px 8px' }}>Name</th>
+              <th style={{ padding: '6px 8px' }}>Last updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(({ name, lastUpdated }) => (
+              <tr key={name} style={{ borderBottom: '1px solid #eee' }}>
+                <td style={{ padding: '10px 8px' }}>
+                  <a href={`/components/${name}`} style={{ color: '#0070d2', textDecoration: 'none' }}>{name}</a>
+                </td>
+                <td style={{ padding: '10px 8px', fontSize: 12, color: '#666' }}>{formatDate(lastUpdated)}</td>
+              </tr>
+            ))}
+            {filtered.length === 0 && (
+              <tr><td colSpan={2} style={{ padding: 16, color: '#999', textAlign: 'center' }}>
+                No components match "{query}"
+              </td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </Layout>
   );
@@ -1053,7 +1076,7 @@ export default function NewComponent() {
     });
     setSaving(false);
     if (res.ok) {
-      router.push(`/components/${name}`);
+      router.push(`/components/${name}/manifest`);
     } else {
       const body = await res.json();
       setError(body.error || 'Failed to create component');
@@ -1105,12 +1128,11 @@ git commit -m "feat: create component page"
 
 ---
 
-## Task 6: Manifest Get/Edit + Monaco JSON Editor
+## Task 6: Manifest Get/Edit API + JsonEditor Component
 
 **Files:**
 - Add to `routes/components.js`: GET + PUT `:name`
 - Create: `components/JsonEditor.js`
-- Create: `pages/components/[name].js` (Manifest tab only for now)
 
 - [ ] **Step 1: Add tests for get/put manifest**
 
@@ -1237,179 +1259,22 @@ export default function JsonEditor({ value, onChange, onValidate, readOnly = fal
 }
 ```
 
-- [ ] **Step 6: Create pages/components/[name].js (Manifest tab)**
+- [ ] **Step 6: Verify API in browser** — use `curl` or the browser to confirm GET/PUT work against the local dev server.
 
-```jsx
-// pages/components/[name].js
-// Single-page dashboard — every section visible at once, no tabs.
-// Each section is rendered as a "Card"; later tasks fill in their section's data fetching.
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/router';
-import Layout from '../../components/Layout.js';
-import JsonEditor from '../../components/JsonEditor.js';
-
-function Card({ title, children, wide = false, actions }) {
-  return (
-    <section
-      style={{
-        gridColumn: wide ? '1 / -1' : 'span 1',
-        background: '#fff',
-        border: '1px solid #e5e5e5',
-        borderRadius: 6,
-        padding: 16,
-        boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
-      }}
-    >
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h3 style={{ margin: 0, fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.5, color: '#666' }}>{title}</h3>
-        {actions}
-      </header>
-      {children}
-    </section>
-  );
-}
-
-export default function ComponentDashboard() {
-  const router = useRouter();
-  const { name } = router.query;
-  const [env, setEnv] = useState('dev');
-
-  // Manifest section state
-  const [manifest, setManifest] = useState(null);
-  const [editorValue, setEditorValue] = useState('');
-  const [editorValid, setEditorValid] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsg] = useState('');
-
-  useEffect(() => {
-    if (!name) return;
-    fetch(`/api/components/${name}?env=${env}`)
-      .then(r => r.json())
-      .then(data => {
-        setManifest(data);
-        setEditorValue(JSON.stringify(data, null, 2));
-      });
-  }, [name, env]);
-
-  async function saveManifest() {
-    setSaving(true);
-    setSaveMsg('');
-    const res = await fetch(`/api/components/${name}?env=${env}`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: editorValue
-    });
-    setSaving(false);
-    setSaveMsg(res.ok ? 'Saved' : 'Error saving');
-  }
-
-  return (
-    <Layout env={env} onEnvChange={setEnv}>
-      <div style={{ padding: 24, maxWidth: 1400, margin: '0 auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-          <div>
-            <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
-            <h1 style={{ margin: '4px 0' }}>{name}</h1>
-          </div>
-          <a
-            href={`/analytics?component=${name}`}
-            style={{ padding: '8px 16px', border: '1px solid #0070d2', color: '#0070d2', borderRadius: 4, textDecoration: 'none' }}
-          >
-            Full Analytics →
-          </a>
-        </div>
-
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, 1fr)',
-          gap: 16
-        }}>
-          <Card title="Overview">
-            {manifest ? (
-              <dl style={{ margin: 0, fontSize: 13 }}>
-                <dt style={{ color: '#666' }}>Engine</dt>
-                <dd style={{ margin: '0 0 8px', fontFamily: 'monospace' }}>{manifest.engine || '—'}</dd>
-                <dt style={{ color: '#666' }}>JS file</dt>
-                <dd style={{ margin: '0 0 8px', fontFamily: 'monospace', wordBreak: 'break-all' }}>{manifest.js || '—'}</dd>
-                <dt style={{ color: '#666' }}>Last updated</dt>
-                <dd style={{ margin: 0 }}>{manifest.metaData?.updatedAt ? new Date(manifest.metaData.updatedAt).toLocaleString() : '—'}</dd>
-              </dl>
-            ) : <p>Loading…</p>}
-          </Card>
-
-          <Card title="Notes" /* Task 13 wires data fetching */>
-            <p style={{ color: '#999' }}>Notes section — filled in Task 13</p>
-          </Card>
-
-          <Card title="Manifest" wide actions={
-            <div>
-              {saveMsg && <span style={{ marginRight: 8, fontSize: 12, color: '#666' }}>{saveMsg}</span>}
-              <button onClick={saveManifest} disabled={!editorValid || saving}>
-                {saving ? 'Saving…' : 'Save Manifest'}
-              </button>
-            </div>
-          }>
-            <JsonEditor
-              value={editorValue}
-              onChange={v => setEditorValue(v ?? '')}
-              onValidate={setEditorValid}
-              height="360px"
-            />
-          </Card>
-
-          <Card title="Access">
-            <p style={{ color: '#999' }}>Access section — filled in Task 11</p>
-          </Card>
-
-          <Card title="Alerts (Slack)">
-            <p style={{ color: '#999' }}>Alerts section — filled in Task 12</p>
-          </Card>
-
-          <Card title="i18n Version">
-            <p style={{ color: '#999' }}>i18n section — filled in Task 9</p>
-          </Card>
-
-          <Card title="RUM Config">
-            <p style={{ color: '#999' }}>RUM section — filled in Task 10</p>
-          </Card>
-
-          <Card title="Environment Sync" wide>
-            <p style={{ color: '#999' }}>Sync section — filled in Task 8</p>
-          </Card>
-
-          <Card title="Recent History" wide>
-            <p style={{ color: '#999' }}>History section — filled in Task 7</p>
-          </Card>
-
-          <Card title="Analytics — last 24h" wide>
-            <p style={{ color: '#999' }}>Inline mini-charts — filled in Task 14</p>
-          </Card>
-        </div>
-      </div>
-    </Layout>
-  );
-}
-```
-
-**Dashboard layout philosophy:** every piece of information about a component is on one scrollable page. The `Card` primitive provides consistent framing; each section fills its own card in later tasks. The `wide` prop spans both columns for sections that need horizontal space (manifest editor, sync table, history timeline, analytics charts).
-
-- [ ] **Step 7: Verify in browser** — navigate to a component, edit JSON, confirm save button disables on invalid JSON.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add routes/components.js components/JsonEditor.js pages/components/[name].js test/routes/components.test.js
-git commit -m "feat: manifest view/edit with Monaco JSON validation"
+git add routes/components.js components/JsonEditor.js test/routes/components.test.js
+git commit -m "feat: manifest GET/PUT API + JsonEditor component"
 ```
 
 ---
 
-## Task 7: History + Rollback
+## Task 7: History + Rollback API + HistoryTimeline Component
 
 **Files:**
 - Add to `routes/components.js`: GET `:name/history`, POST `:name/rollback`
 - Create: `components/HistoryTimeline.js`
-- Fill in "Recent History" card in `pages/components/[name].js`
 
 - [ ] **Step 1: Add tests**
 
@@ -1516,56 +1381,2119 @@ export default function HistoryTimeline({ history, onRollback, loading }) {
 }
 ```
 
-- [ ] **Step 6: Fill in the "Recent History" card in [name].js**
+- [ ] **Step 6: Commit**
 
-In `pages/components/[name].js`, add state and data fetching for history, then replace the History placeholder:
+```bash
+git add routes/components.js components/HistoryTimeline.js
+git commit -m "feat: manifest history/rollback API + HistoryTimeline component"
+```
+
+---
+
+## Task 8: ComponentNav + Component Main Dashboard Page
+
+**Files:**
+- Create: `components/ComponentNav.js`
+- Create: `pages/components/[name]/index.js`
+
+The main page shows RUM sparklines + error sparklines + a notes textarea. It fetches the manifest only to read `metaData.updatedAt` for the overview header — the full editor lives on the Manifest sub-page. Sparklines come from the analytics API. The notes textarea auto-saves.
+
+`ComponentNav` is the tab bar reused on every sub-page. It reads the current path to highlight the active tab.
+
+- [ ] **Step 1: Create components/ComponentNav.js**
 
 ```jsx
-// Add to state:
-const [history, setHistory] = useState([]);
-const [historyLoading, setHistoryLoading] = useState(false);
+// components/ComponentNav.js
+// Shared tab bar for all /components/[name]/* pages.
+// Highlights the active tab by comparing href to the current path.
+import { useRouter } from 'next/router';
 
-// Add useEffect (alongside manifest fetch):
-useEffect(() => {
-  if (!name || tab !== 'History') return;
-  setHistoryLoading(true);
-  fetch(`/api/components/${name}/history?env=${env}`)
-    .then(r => r.json())
-    .then(data => { setHistory(data); setHistoryLoading(false); });
-}, [name, env, tab]);
+const TABS = [
+  { label: 'Overview',  href: '' },         // /components/[name]
+  { label: 'Manifest',  href: '/manifest' },
+  { label: 'Auth',      href: '/auth' },
+  { label: 'RUM',       href: '/rum' },
+  { label: 'Logs',      href: '/logs' },
+  { label: 'Sync',      href: '/sync' },
+];
 
-// Replace the History placeholder with:
-{tab === 'History' && (
-  <HistoryTimeline
-    history={history}
-    loading={historyLoading}
-    onRollback={async value => {
-      await fetch(`/api/components/${name}/rollback?env=${env}`, {
-        method: 'POST',
+export default function ComponentNav({ name, env }) {
+  const router = useRouter();
+  const base = `/components/${name}`;
+
+  return (
+    <nav style={{ borderBottom: '1px solid #e5e5e5', marginBottom: 24, display: 'flex', gap: 0, alignItems: 'center' }}>
+      <span style={{ fontSize: 14, fontWeight: 600, marginRight: 24, color: '#333' }}>{name}</span>
+      {TABS.map(({ label, href }) => {
+        const url = `${base}${href}`;
+        const active = router.asPath.startsWith(url + '?') || router.asPath === url ||
+          (href === '' && router.asPath === base);
+        return (
+          <a
+            key={label}
+            href={`${url}?env=${env}`}
+            style={{
+              padding: '10px 16px',
+              textDecoration: 'none',
+              borderBottom: active ? '2px solid #0070d2' : '2px solid transparent',
+              color: active ? '#0070d2' : '#555',
+              fontWeight: active ? 600 : 400,
+              fontSize: 14
+            }}
+          >
+            {label}
+          </a>
+        );
+      })}
+    </nav>
+  );
+}
+```
+
+- [ ] **Step 2: Create pages/components/[name]/index.js**
+
+```jsx
+// pages/components/[name]/index.js
+// Main dashboard: RUM sparklines + error sparklines + notes textarea.
+// Fetches the manifest only for lastUpdated; full editing is on the Manifest sub-page.
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/router';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import Notes from '../../../components/Notes.js';
+import MiniChart from '../../../components/charts/MiniChart.js';
+
+export default function ComponentMain() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+  const [manifest, setManifest] = useState(null);
+  const [errors, setErrors] = useState({ total: 0, buckets: [] });
+  const [volume, setVolume] = useState({ buckets: [] });
+  const [vitals, setVitals] = useState({ buckets: [] });
+
+  useEffect(() => {
+    if (!name) return;
+    fetch(`/api/components/${name}?env=${env}`).then(r => r.json()).then(setManifest);
+    const p = `component=${name}&from=now-1d&to=now`;
+    fetch(`/api/analytics/errors?${p}`).then(r => r.json()).then(setErrors);
+    fetch(`/api/analytics/volume?${p}`).then(r => r.json()).then(setVolume);
+    fetch(`/api/analytics/vitals?${p}`).then(r => r.json()).then(setVitals);
+  }, [name, env]);
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', margin: '8px 0 16px' }}>
+          <div>
+            <h1 style={{ margin: 0 }}>{name}</h1>
+            {manifest?.metaData?.updatedAt && (
+              <p style={{ margin: '4px 0 0', fontSize: 12, color: '#666' }}>
+                Last updated: {new Date(manifest.metaData.updatedAt).toLocaleString()} · {manifest.engine || '—'} · {manifest.js || '—'}
+              </p>
+            )}
+          </div>
+          <a href={`/analytics?component=${name}`} style={{ fontSize: 13, color: '#0070d2' }}>Full analytics →</a>
+        </div>
+
+        {name && <ComponentNav name={name} env={env} />}
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 32 }}>
+          <MiniChart data={errors.buckets} dataKey="count" color="#e53e3e"
+            label={`Errors — last 24h (${errors.total} total)`} />
+          <MiniChart data={volume.buckets} dataKey="count" color="#38a169"
+            label="Request volume — last 24h" />
+          <MiniChart data={vitals.buckets} dataKey="lcp_p75" color="#3182ce"
+            label="LCP p75 — last 24h" unit="ms" />
+        </div>
+
+        {name && <Notes componentName={name} env={env} />}
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 3: Verify in browser** — navigate to `/components/{name}`, confirm sparklines load, notes auto-save works, tab bar renders.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add components/ComponentNav.js pages/components/
+git commit -m "feat: ComponentNav + component main dashboard page"
+```
+
+---
+
+## Task 9: Notes API + Notes Component
+
+**Files:**
+- Create: `routes/notes.js`
+- Create: `test/routes/notes.test.js`
+- Create: `components/Notes.js`
+
+- [ ] **Step 1: Write failing tests**
+
+```js
+// test/routes/notes.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockCdsGet = jest.fn();
+const mockCdsPut = jest.fn();
+const mockCdsAuthGet = jest.fn().mockResolvedValue({ jomax: ['jroig'] });
+const mockCdsAdminGet = jest.fn().mockResolvedValue({ jomax: [] });
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsClient: jest.fn(() => ({ get: mockCdsGet, put: mockCdsPut })),
+  getCdsAuthClient: jest.fn(() => ({ get: mockCdsAuthGet })),
+  getCdsAdminClient: jest.fn(() => ({ get: mockCdsAdminGet }))
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/notes.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/components/:name/notes returns string', async () => {
+  mockCdsGet.mockResolvedValue('# Deployment notes\n\nRolled back due to LCP regression.');
+  const res = await request(app).get('/api/components/componentA/notes?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '# Deployment notes\n\nRolled back due to LCP regression.' });
+});
+
+test('GET /api/components/:name/notes returns empty when unset', async () => {
+  mockCdsGet.mockResolvedValue(null);
+  const res = await request(app).get('/api/components/componentA/notes?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '' });
+});
+
+test('PUT /api/components/:name/notes writes string', async () => {
+  mockCdsPut.mockResolvedValue();
+  const res = await request(app)
+    .put('/api/components/componentA/notes?env=dev')
+    .send({ value: '## New notes' });
+  expect(res.status).toBe(200);
+  expect(mockCdsPut).toHaveBeenCalledWith('registry.componentA.notes', '## New notes');
+});
+
+test('PUT /api/components/:name/notes rejects non-string body', async () => {
+  const res = await request(app)
+    .put('/api/components/componentA/notes?env=dev')
+    .send({ value: { not: 'a string' } });
+  expect(res.status).toBe(400);
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+```bash
+npm test -- test/routes/notes.test.js
+```
+
+- [ ] **Step 3: Create routes/notes.js**
+
+```js
+// routes/notes.js
+import express from 'express';
+import { getCdsClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+
+const router = express.Router();
+
+router.get('/api/components/:name/notes', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    await assertCanAccess(req.params.name, req.user.accountName, env);
+    const value = await getCdsClient(env).get(`registry.${req.params.name}.notes`);
+    res.json({ value: value ?? '' });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.put('/api/components/:name/notes', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    if (typeof req.body.value !== 'string') {
+      return res.status(400).json({ error: 'value must be a string' });
+    }
+    await getCdsClient(env).put(`registry.${name}.notes`, req.body.value);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create components/Notes.js**
+
+```jsx
+// components/Notes.js
+// Plain-text textarea with debounced auto-save (1.5s after typing stops).
+import { useState, useEffect, useRef } from 'react';
+
+export default function Notes({ componentName, env }) {
+  const [value, setValue] = useState('');
+  const [status, setStatus] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    fetch(`/api/components/${componentName}/notes?env=${env}`)
+      .then(r => r.json())
+      .then(data => { setValue(data.value ?? ''); setLoaded(true); });
+  }, [componentName, env]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    clearTimeout(saveTimer.current);
+    setStatus('editing…');
+    saveTimer.current = setTimeout(async () => {
+      setStatus('saving…');
+      const res = await fetch(`/api/components/${componentName}/notes?env=${env}`, {
+        method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ value })
       });
-      // Refresh manifest after rollback
-      fetch(`/api/components/${name}?env=${env}`).then(r => r.json()).then(setManifest);
-    }}
-  />
-)}
+      setStatus(res.ok ? 'saved' : 'save failed');
+      setTimeout(() => setStatus(''), 1500);
+    }, 1500);
+    return () => clearTimeout(saveTimer.current);
+  }, [value]);
+
+  if (!loaded) return <p>Loading…</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+        <label style={{ fontSize: 13, fontWeight: 600, color: '#555' }}>Notes</label>
+        <span style={{ fontSize: 11, color: '#999' }}>{status}</span>
+      </div>
+      <textarea
+        value={value}
+        onChange={e => setValue(e.target.value)}
+        placeholder="Add deployment notes, known issues, anything the team should know…"
+        style={{ width: '100%', minHeight: 160, fontFamily: 'monospace', fontSize: 13, padding: 8,
+          border: '1px solid #ccc', borderRadius: 4, resize: 'vertical', boxSizing: 'border-box' }}
+      />
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add routes/notes.js test/routes/notes.test.js components/Notes.js
+git commit -m "feat: notes API + auto-save Notes component"
+```
+
+---
+
+## Task 10: Manifest Sub-page
+
+**Files:**
+- Create: `pages/components/[name]/manifest.js`
+- Create: `routes/i18n.js` (needed by this page)
+- Create: `clients/slack.js`
+- Create: `routes/alerts.js`
+
+This page brings together everything manifest-related: the JSON editor, history/rollback, i18n version hash, and Slack alert config. It reuses `JsonEditor`, `HistoryTimeline`, and the alerts API. The i18n API and alerts API are implemented here because they're only used on this page.
+
+- [ ] **Step 1: Create routes/i18n.js**
+
+```js
+// routes/i18n.js
+import express from 'express';
+import { getCdsClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+
+const router = express.Router();
+
+router.get('/api/components/:name/i18n', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const value = await getCdsClient(env).get(`registry.${req.params.name}.i18nVersion`);
+    if (value == null) return res.status(404).json({ error: 'i18n not configured' });
+    res.json({ value });
+  } catch (err) { next(err); }
+});
+
+router.put('/api/components/:name/i18n', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    await getCdsClient(env).put(`registry.${name}.i18nVersion`, req.body.value);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.get('/api/components/:name/i18n/history', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const history = await getCdsClient(env).getHistory(`registry.${req.params.name}.i18nVersion`);
+    res.json(history ?? []);
+  } catch (err) { next(err); }
+});
+
+router.post('/api/components/:name/i18n/rollback', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    await getCdsClient(env).put(`registry.${name}.i18nVersion`, req.body.value);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+export default router;
+```
+
+- [ ] **Step 2: Create clients/slack.js**
+
+```js
+// clients/slack.js
+export async function sendSlackMessage(webhookUrl, text) {
+  const res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  if (!res.ok) throw new Error(`Slack webhook failed: ${res.status}`);
+}
+```
+
+- [ ] **Step 3: Create routes/alerts.js**
+
+```js
+// routes/alerts.js
+import express from 'express';
+import { getCdsAdminClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+import { sendSlackMessage } from '../clients/slack.js';
+
+const router = express.Router();
+
+router.get('/api/alerts/:name', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const config = await getCdsAdminClient(env).get(`config.${req.params.name}`);
+    res.json(config ?? { slackWebhookUrl: null });
+  } catch (err) { next(err); }
+});
+
+router.put('/api/alerts/:name', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    await getCdsAdminClient(env).put(`config.${name}`, { slackWebhookUrl: req.body.slackWebhookUrl });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.post('/api/alerts/:name/test', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const config = await getCdsAdminClient(env).get(`config.${req.params.name}`);
+    if (!config?.slackWebhookUrl) return res.status(400).json({ error: 'No Slack webhook configured' });
+    await sendSlackMessage(config.slackWebhookUrl, `Test message from CDS Admin for ${req.params.name}`);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Write failing tests for i18n and alerts routes**
+
+```js
+// test/routes/i18n.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+const mockGetHistory = jest.fn();
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsClient: jest.fn(() => ({ get: mockGet, put: mockPut, getHistory: mockGetHistory })),
+  getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/i18n.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/components/:name/i18n returns hash string', async () => {
+  mockGet.mockResolvedValue('607a011');
+  const res = await request(app).get('/api/components/componentA/i18n?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '607a011' });
+});
+
+test('GET /api/components/:name/i18n returns 404 when not set', async () => {
+  mockGet.mockResolvedValue(null);
+  const res = await request(app).get('/api/components/componentA/i18n?env=dev');
+  expect(res.status).toBe(404);
+});
+
+test('PUT /api/components/:name/i18n updates hash', async () => {
+  mockPut.mockResolvedValue();
+  const res = await request(app)
+    .put('/api/components/componentA/i18n?env=dev')
+    .send({ value: 'abc1234' });
+  expect(res.status).toBe(200);
+  expect(mockPut).toHaveBeenCalledWith('registry.componentA.i18nVersion', 'abc1234');
+});
+```
+
+```js
+// test/routes/alerts.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsAdminClient: jest.fn(() => ({ get: mockGet, put: mockPut })),
+  getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
+}));
+jest.unstable_mockModule('../../clients/slack.js', () => ({
+  sendSlackMessage: jest.fn().mockResolvedValue()
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/alerts.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/alerts/:name returns slack config', async () => {
+  mockGet.mockResolvedValue({ slackWebhookUrl: 'https://hooks.slack.com/test' });
+  const res = await request(app).get('/api/alerts/componentA?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body.slackWebhookUrl).toBe('https://hooks.slack.com/test');
+});
+
+test('POST /api/alerts/:name/test sends a slack message', async () => {
+  mockGet.mockResolvedValue({ slackWebhookUrl: 'https://hooks.slack.com/test' });
+  const { sendSlackMessage } = await import('../../clients/slack.js');
+  const res = await request(app).post('/api/alerts/componentA/test?env=dev');
+  expect(res.status).toBe(200);
+  expect(sendSlackMessage).toHaveBeenCalledWith('https://hooks.slack.com/test', expect.stringContaining('componentA'));
+});
+```
+
+- [ ] **Step 5: Run tests — expect FAIL, then implement, then PASS**
+
+```bash
+npm test -- test/routes/i18n.test.js test/routes/alerts.test.js
+```
+
+- [ ] **Step 6: Create pages/components/[name]/manifest.js**
+
+```jsx
+// pages/components/[name]/manifest.js
+// Manifest editor + history/rollback + i18n version + Slack alert config.
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/router';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import JsonEditor from '../../../components/JsonEditor.js';
+import HistoryTimeline from '../../../components/HistoryTimeline.js';
+
+export default function ManifestPage() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+  const [manifest, setManifest] = useState(null);
+  const [editorValue, setEditorValue] = useState('');
+  const [editorValid, setEditorValid] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [history, setHistory] = useState([]);
+  const [i18n, setI18n] = useState('');
+  const [webhook, setWebhook] = useState('');
+
+  useEffect(() => {
+    if (!name) return;
+    fetch(`/api/components/${name}?env=${env}`).then(r => r.json()).then(m => {
+      setManifest(m);
+      setEditorValue(JSON.stringify(m, null, 2));
+    });
+    fetch(`/api/components/${name}/history?env=${env}`).then(r => r.json()).then(setHistory);
+    fetch(`/api/components/${name}/i18n?env=${env}`).then(r => r.ok ? r.json() : { value: '' }).then(d => setI18n(d.value ?? ''));
+    fetch(`/api/alerts/${name}?env=${env}`).then(r => r.json()).then(d => setWebhook(d.slackWebhookUrl ?? ''));
+  }, [name, env]);
+
+  async function saveManifest() {
+    setSaving(true);
+    setSaveMsg('');
+    const res = await fetch(`/api/components/${name}?env=${env}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: editorValue
+    });
+    setSaving(false);
+    setSaveMsg(res.ok ? 'Saved' : 'Error saving');
+    if (res.ok) fetch(`/api/components/${name}/history?env=${env}`).then(r => r.json()).then(setHistory);
+  }
+
+  const sectionStyle = { marginBottom: 32 };
+  const headingStyle = { fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.5, color: '#666', marginBottom: 12 };
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
+        {name && <ComponentNav name={name} env={env} />}
+
+        <section style={sectionStyle}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <h3 style={headingStyle}>Manifest</h3>
+            <div>
+              {saveMsg && <span style={{ marginRight: 8, fontSize: 12, color: '#666' }}>{saveMsg}</span>}
+              <button onClick={saveManifest} disabled={!editorValid || saving}>
+                {saving ? 'Saving…' : 'Save Manifest'}
+              </button>
+            </div>
+          </div>
+          <JsonEditor value={editorValue} onChange={v => setEditorValue(v ?? '')}
+            onValidate={setEditorValid} height="400px" />
+        </section>
+
+        <section style={sectionStyle}>
+          <h3 style={headingStyle}>History</h3>
+          <HistoryTimeline history={history} onRollback={async value => {
+            await fetch(`/api/components/${name}/rollback?env=${env}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value })
+            });
+            const m = await fetch(`/api/components/${name}?env=${env}`).then(r => r.json());
+            setManifest(m); setEditorValue(JSON.stringify(m, null, 2));
+            fetch(`/api/components/${name}/history?env=${env}`).then(r => r.json()).then(setHistory);
+          }} />
+        </section>
+
+        <section style={{ ...sectionStyle, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+          <div>
+            <h3 style={headingStyle}>i18n Version Hash</h3>
+            <input value={i18n} onChange={e => setI18n(e.target.value)}
+              placeholder="e.g. 607a011" style={{ width: '100%', marginBottom: 8 }} />
+            <button onClick={async () => {
+              await fetch(`/api/components/${name}/i18n?env=${env}`, {
+                method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: i18n })
+              });
+            }}>Save i18n</button>
+          </div>
+          <div>
+            <h3 style={headingStyle}>Slack Alerts</h3>
+            <input value={webhook} onChange={e => setWebhook(e.target.value)}
+              placeholder="https://hooks.slack.com/…" style={{ width: '100%', marginBottom: 8 }} />
+            <button onClick={async () => {
+              await fetch(`/api/alerts/${name}?env=${env}`, {
+                method: 'PUT', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ slackWebhookUrl: webhook })
+              });
+            }}>Save Webhook</button>
+            <button onClick={() => fetch(`/api/alerts/${name}/test?env=${env}`, { method: 'POST' })}
+              disabled={!webhook} style={{ marginLeft: 8 }}>
+              Send test message
+            </button>
+          </div>
+        </section>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 7: Verify in browser** — navigate to `/components/{name}/manifest`, edit JSON, confirm save and rollback work, i18n hash saves, Slack test fires.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add routes/i18n.js routes/alerts.js clients/slack.js \
+  test/routes/i18n.test.js test/routes/alerts.test.js \
+  pages/components/
+git commit -m "feat: manifest sub-page with editor, history, i18n, and Slack alerts"
+```
+
+---
+
+## Task 11: Access API + AccessList Component
+
+**Files:**
+- Create: `routes/access.js`
+- Create: `test/routes/access.test.js`
+- Create: `components/AccessList.js`
+
+- [ ] **Step 1: Write failing tests**
+
+```js
+// test/routes/access.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsAuthClient: jest.fn(() => ({ get: mockGet, put: mockPut }))
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/access.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/access/:name returns allowlist entry', async () => {
+  mockGet.mockResolvedValue({ jomax: ['jroig'], cert: [''], awsiam: [''] });
+  const res = await request(app).get('/api/access/componentA?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body.jomax).toEqual(['jroig']);
+});
+
+test('PUT /api/access/:name updates jomax array', async () => {
+  mockGet.mockResolvedValue({ jomax: ['jroig'], cert: [''], awsiam: [''] });
+  mockPut.mockResolvedValue();
+  const res = await request(app)
+    .put('/api/access/componentA?env=dev')
+    .send({ jomax: ['jroig', 'alice'] });
+  expect(res.status).toBe(200);
+  expect(mockPut).toHaveBeenCalledWith('componentA', { jomax: ['jroig', 'alice'], cert: [''], awsiam: [''] });
+});
+
+test('PUT /api/access/:name rejects empty jomax array (lockout prevention)', async () => {
+  mockGet.mockResolvedValue({ jomax: ['jroig'], cert: [''], awsiam: [''] });
+  const res = await request(app)
+    .put('/api/access/componentA?env=dev')
+    .send({ jomax: [] });
+  expect(res.status).toBe(400);
+  expect(mockPut).not.toHaveBeenCalled();
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+- [ ] **Step 3: Create routes/access.js**
+
+```js
+// routes/access.js
+import express from 'express';
+import { getCdsAuthClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+
+const router = express.Router();
+
+router.get('/api/access/:name', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const entry = await getCdsAuthClient(env).get(req.params.name);
+    if (!entry) return res.status(404).json({ error: 'Component access entry not found' });
+    res.json(entry);
+  } catch (err) { next(err); }
+});
+
+router.put('/api/access/:name', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    const newJomax = Array.isArray(req.body.jomax) ? req.body.jomax : [];
+    if (newJomax.length === 0) {
+      return res.status(400).json({ error: 'Allowlist cannot be empty (at least one jomax user required)' });
+    }
+    const current = await getCdsAuthClient(env).get(name) ?? { jomax: [], cert: [''], awsiam: [''] };
+    await getCdsAuthClient(env).put(name, { ...current, jomax: newJomax });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create components/AccessList.js**
+
+```jsx
+// components/AccessList.js
+// Shows jomax, cert, awsiam sections. Only jomax is editable through the UI.
+// cert and awsiam are shown read-only (edit via direct Switchboard access or CLI).
+import { useState, useEffect } from 'react';
+
+export default function AccessList({ componentName, env }) {
+  const [entry, setEntry] = useState(null);
+  const [newUser, setNewUser] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch(`/api/access/${componentName}?env=${env}`).then(r => r.json()).then(setEntry);
+  }, [componentName, env]);
+
+  async function saveJomax(newJomax) {
+    setSaving(true);
+    setError('');
+    const res = await fetch(`/api/access/${componentName}?env=${env}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jomax: newJomax })
+    });
+    setSaving(false);
+    if (res.ok) {
+      setEntry(e => ({ ...e, jomax: newJomax }));
+    } else {
+      const body = await res.json();
+      setError(body.error || 'Failed to update');
+    }
+  }
+
+  if (!entry) return <p>Loading…</p>;
+
+  const canRemove = entry.jomax.filter(u => u !== '').length > 1;
+
+  return (
+    <div>
+      {error && <p style={{ color: 'red' }}>{error}</p>}
+
+      <h4>Jomax users</h4>
+      <ul style={{ margin: '0 0 8px', padding: 0, listStyle: 'none' }}>
+        {entry.jomax.filter(u => u !== '').map(user => (
+          <li key={user} style={{ marginBottom: 4 }}>
+            {user}
+            <button
+              onClick={() => saveJomax(entry.jomax.filter(u => u !== user))}
+              disabled={saving || !canRemove}
+              title={!canRemove ? 'Cannot remove the last user' : ''}
+              style={{ marginLeft: 8, fontSize: 11 }}
+            >
+              Remove
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input value={newUser} onChange={e => setNewUser(e.target.value)} placeholder="jomax username" />
+        <button onClick={() => { saveJomax([...entry.jomax.filter(u => u !== ''), newUser]); setNewUser(''); }}
+          disabled={saving || !newUser}>
+          Add
+        </button>
+      </div>
+
+      {entry.cert?.filter(c => c !== '').length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <h4>Cert (read-only — edit via Switchboard or CLI)</h4>
+          <ul>{entry.cert.filter(c => c !== '').map(c => <li key={c} style={{ fontFamily: 'monospace', fontSize: 12 }}>{c}</li>)}</ul>
+        </div>
+      )}
+
+      {entry.awsiam?.filter(a => a !== '').length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <h4>AWS IAM (read-only — edit via Switchboard or CLI)</h4>
+          <ul>{entry.awsiam.filter(a => a !== '').map(a => <li key={a} style={{ fontFamily: 'monospace', fontSize: 12 }}>{a}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add routes/access.js test/routes/access.test.js components/AccessList.js
+git commit -m "feat: cds-auth access API + AccessList component"
+```
+
+---
+
+## Task 12: Auth Sub-page + Docs Page
+
+**Files:**
+- Create: `pages/components/[name]/auth.js`
+- Create: `pages/docs/cds-auth.js`
+
+- [ ] **Step 1: Create pages/components/[name]/auth.js**
+
+```jsx
+// pages/components/[name]/auth.js
+// Shows the cds-auth allowlist (jomax editable, cert/awsiam read-only)
+// and links to the cds-auth docs page.
+import { useRouter } from 'next/router';
+import { useState } from 'react';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import AccessList from '../../../components/AccessList.js';
+
+export default function AuthPage() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
+        {name && <ComponentNav name={name} env={env} />}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+          <h2 style={{ margin: 0 }}>Access Control</h2>
+          <a href="/docs/cds-auth" target="_blank" style={{ fontSize: 13, color: '#0070d2' }}>
+            How cds-auth works →
+          </a>
+        </div>
+
+        <p style={{ color: '#555', fontSize: 13, marginBottom: 24 }}>
+          Jomax usernames in the allowlist can deploy and modify this component.
+          Cert and AWS IAM entries are managed via Switchboard directly or via the CDS CLI.
+        </p>
+
+        {name && <AccessList componentName={name} env={env} />}
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 2: Create pages/docs/cds-auth.js**
+
+```jsx
+// pages/docs/cds-auth.js
+// Static explainer page for cds-auth. Linked from the Auth sub-page.
+import Layout from '../../components/Layout.js';
+
+export default function CdsAuthDocs() {
+  return (
+    <Layout>
+      <div style={{ padding: 24, maxWidth: 760, margin: '0 auto', lineHeight: 1.7 }}>
+        <a href="javascript:history.back()" style={{ fontSize: 12, color: '#666' }}>← Back</a>
+        <h1>How cds-auth works</h1>
+        <p>
+          CDS uses a per-component allowlist stored in the <code>cds-auth</code> Switchboard app.
+          Each component has a key matching its name (e.g. <code>bamMediaManagerEsm</code>) with a
+          value like:
+        </p>
+        <pre style={{ background: '#f6f8fa', padding: 16, borderRadius: 4, overflow: 'auto' }}>{`{
+  "jomax": ["jroig", "tbogart"],
+  "cert": [""],
+  "awsiam": [""]
+}`}</pre>
+        <h2>Auth types</h2>
+        <dl>
+          <dt><strong>jomax</strong></dt>
+          <dd>GoDaddy Jomax SSO usernames. Engineers use jomax auth when deploying via the CDS CLI or this admin tool.</dd>
+          <dt><strong>cert</strong></dt>
+          <dd>Client certificate identities (e.g. service accounts). Used by automated pipelines. Edit via Switchboard directly or the CDS CLI.</dd>
+          <dt><strong>awsiam</strong></dt>
+          <dd>AWS IAM ARNs. Used by CI/CD pipelines running on AWS. Edit via Switchboard directly or the CDS CLI.</dd>
+        </dl>
+        <h2>Editing the allowlist</h2>
+        <ul>
+          <li>Jomax users — edit via the Auth tab in this tool</li>
+          <li>Cert / AWS IAM — edit via Switchboard directly, or use the CDS CLI: <code>cds access add --cert &lt;identity&gt;</code></li>
+        </ul>
+        <p>
+          Super-admins (listed in <code>cds-admin.admins.jomax</code>) bypass all per-component checks and can read/write any component in any environment.
+        </p>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 3: Verify in browser** — navigate to `/components/{name}/auth`, add/remove a user, click "How cds-auth works →".
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add pages/components/ pages/docs/
+git commit -m "feat: auth sub-page + cds-auth docs page"
+```
+
+---
+
+## Task 13: Sync API + Sync Sub-page
+
+**Files:**
+- Add to `routes/components.js`: POST `:name/sync`
+- Create: `components/SyncPanel.js`
+- Create: `pages/components/[name]/sync.js`
+
+- [ ] **Step 1: Add test**
+
+Add to `test/routes/components.test.js`:
+
+```js
+test('POST /api/components/:name/sync copies manifest and checks allowlist on toEnv', async () => {
+  const { getCdsAuthClient, getCdsClient } = await import('../../clients/switchboard.js');
+  const authGet = jest.fn().mockResolvedValue({ jomax: ['jroig'] });
+  getCdsAuthClient.mockReturnValue({ get: authGet });
+  const srcManifest = { engine: 'esm', js: 'abc.es.js', dependencies: {} };
+  const srcGet = jest.fn().mockResolvedValue(srcManifest);
+  const dstPut = jest.fn().mockResolvedValue();
+  getCdsClient
+    .mockImplementationOnce(() => ({ get: srcGet }))
+    .mockImplementationOnce(() => ({ put: dstPut }));
+
+  const res = await request(app)
+    .post('/api/components/componentA/sync')
+    .send({ fromEnv: 'prod', toEnv: 'test' });
+
+  expect(res.status).toBe(200);
+  expect(getCdsAuthClient).toHaveBeenCalledWith('test');
+  expect(dstPut).toHaveBeenCalledWith('registry.componentA', srcManifest);
+});
+
+test('POST /api/components/:name/sync returns 403 when not allowlisted on toEnv', async () => {
+  const { getCdsAuthClient } = await import('../../clients/switchboard.js');
+  getCdsAuthClient.mockReturnValue({ get: jest.fn().mockResolvedValue({ jomax: ['alice'] }) });
+
+  const res = await request(app)
+    .post('/api/components/componentA/sync')
+    .send({ fromEnv: 'dev', toEnv: 'prod' });
+
+  expect(res.status).toBe(403);
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+- [ ] **Step 3: Add sync route to routes/components.js**
+
+```js
+router.post('/api/components/:name/sync', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const { fromEnv, toEnv } = req.body;
+    // Allowlist check on DESTINATION env — prevents a dev user from pushing to prod.
+    await assertCanAccess(name, req.user.accountName, toEnv);
+    const manifest = await getCdsClient(fromEnv).get(`registry.${name}`);
+    await getCdsClient(toEnv).put(`registry.${name}`, manifest);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create components/SyncPanel.js**
+
+```jsx
+// components/SyncPanel.js
+import { useState } from 'react';
+
+const ENVS = ['dev', 'test', 'prod'];
+
+export default function SyncPanel({ componentName }) {
+  const [status, setStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function handleSync(fromEnv, toEnv) {
+    if (!confirm(`Copy ${componentName} manifest from ${fromEnv} → ${toEnv}?`)) return;
+    setBusy(true);
+    setStatus('');
+    const res = await fetch(`/api/components/${componentName}/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ fromEnv, toEnv })
+    });
+    setBusy(false);
+    setStatus(res.ok ? `Synced ${fromEnv} → ${toEnv}` : 'Sync failed — check your access on the destination env');
+  }
+
+  return (
+    <div>
+      {status && <p style={{ color: status.includes('failed') ? 'red' : 'green', marginBottom: 16 }}>{status}</p>}
+      <table style={{ borderCollapse: 'collapse' }}>
+        <thead>
+          <tr style={{ borderBottom: '2px solid #eee', fontSize: 12, color: '#666' }}>
+            <th style={{ padding: '6px 16px', textAlign: 'left' }}>From</th>
+            <th style={{ padding: '6px 16px', textAlign: 'left' }}>To</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {ENVS.flatMap(from =>
+            ENVS.filter(to => to !== from).map(to => (
+              <tr key={`${from}-${to}`} style={{ borderBottom: '1px solid #eee' }}>
+                <td style={{ padding: '10px 16px' }}>{from}</td>
+                <td style={{ padding: '10px 16px' }}>{to}</td>
+                <td style={{ padding: '10px 16px' }}>
+                  <button onClick={() => handleSync(from, to)} disabled={busy} style={{ fontSize: 12 }}>
+                    Copy {from} → {to}
+                  </button>
+                </td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Create pages/components/[name]/sync.js**
+
+```jsx
+// pages/components/[name]/sync.js
+import { useRouter } from 'next/router';
+import { useState } from 'react';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import SyncPanel from '../../../components/SyncPanel.js';
+
+export default function SyncPage() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
+        {name && <ComponentNav name={name} env={env} />}
+        <h2>Environment Sync</h2>
+        <p style={{ color: '#555', fontSize: 13, marginBottom: 24 }}>
+          Copy the manifest from one environment to another. You must be allowlisted on the destination environment.
+        </p>
+        {name && <SyncPanel componentName={name} />}
+      </div>
+    </Layout>
+  );
+}
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add routes/components.js components/HistoryTimeline.js pages/components/[name].js
-git commit -m "feat: history and rollback for manifests"
+git add routes/components.js components/SyncPanel.js pages/components/
+git commit -m "feat: sync API + sync sub-page"
 ```
 
 ---
 
-## Task 8: Environment Sync
+## Task 14: Elasticsearch Client (with Log Level Filter)
 
 **Files:**
-- Add to `routes/components.js`: POST `:name/sync`
-- Create: `components/SyncPanel.js`
+- Create: `clients/elasticsearch.js`
+- Create: `test/clients/elasticsearch.test.js`
+
+`queryErrors` now accepts an optional `level` param (`'error'` | `'warn'` | `'info'` | `'all'`). When `level === 'all'`, the log.level term filter is omitted.
+
+- [ ] **Step 1: Write failing tests**
+
+```js
+// test/clients/elasticsearch.test.js
+import { jest } from '@jest/globals';
+
+const mockLogsSearch = jest.fn().mockResolvedValue({ hits: { total: { value: 5 } }, aggregations: {} });
+const mockRumSearch = jest.fn().mockResolvedValue({ hits: { total: { value: 0 } }, aggregations: {} });
+
+jest.unstable_mockModule('@elastic/elasticsearch', () => ({
+  Client: jest.fn().mockImplementation(({ node }) => ({
+    search: node.includes('rum') ? mockRumSearch : mockLogsSearch
+  }))
+}));
+
+process.env.ELASTICSEARCH_LOGS_URL = 'https://logs.example.com';
+process.env.ELASTICSEARCH_LOGS_API_KEY = 'bG9nczp0ZXN0';
+process.env.ELASTICSEARCH_RUM_URL = 'https://rum.example.com';
+process.env.ELASTICSEARCH_RUM_API_KEY = 'cnVtOnRlc3Q=';
+
+const { getLogsClient, getRumClient, queryErrors, queryRequestVolume, queryWebVitals } = await import('../../clients/elasticsearch.js');
+
+test('getLogsClient returns singleton', () => {
+  expect(getLogsClient()).toBe(getLogsClient());
+});
+
+test('getRumClient is distinct from logs client', () => {
+  expect(getLogsClient()).not.toBe(getRumClient());
+});
+
+test('queryErrors with level=error filters by log.level', async () => {
+  await queryErrors('myComponent', 'now-1d', 'now', 'error');
+  expect(mockLogsSearch).toHaveBeenCalledWith(expect.objectContaining({
+    index: '.ds-cds-api-prod-logs-*',
+    body: expect.objectContaining({
+      query: expect.objectContaining({
+        bool: expect.objectContaining({
+          must: expect.arrayContaining([{ term: { 'log.level': 'error' } }])
+        })
+      })
+    })
+  }));
+});
+
+test('queryErrors with level=all omits log.level filter', async () => {
+  mockLogsSearch.mockClear();
+  await queryErrors('myComponent', 'now-1d', 'now', 'all');
+  const body = mockLogsSearch.mock.calls[0][0].body;
+  const must = body.query.bool.must;
+  expect(must.some(c => c.term?.['log.level'])).toBe(false);
+});
+
+test('queryWebVitals calls RUM cluster', async () => {
+  await queryWebVitals('myComponent', 'now-1d', 'now');
+  expect(mockRumSearch).toHaveBeenCalledWith(expect.objectContaining({
+    index: 'sns-traffic-c1-prod*'
+  }));
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+- [ ] **Step 3: Create clients/elasticsearch.js**
+
+```js
+// clients/elasticsearch.js
+import { Client } from '@elastic/elasticsearch';
+
+let logsClient;
+let rumClient;
+
+export function getLogsClient() {
+  if (!logsClient) {
+    logsClient = new Client({
+      node: process.env.ELASTICSEARCH_LOGS_URL,
+      auth: { apiKey: process.env.ELASTICSEARCH_LOGS_API_KEY }
+    });
+  }
+  return logsClient;
+}
+
+export function getRumClient() {
+  if (!rumClient) {
+    rumClient = new Client({
+      node: process.env.ELASTICSEARCH_RUM_URL,
+      auth: { apiKey: process.env.ELASTICSEARCH_RUM_API_KEY }
+    });
+  }
+  return rumClient;
+}
+
+// level: 'error' | 'warn' | 'info' | 'all' — 'all' omits the log.level filter
+export async function queryErrors(componentName, from, to, level = 'error') {
+  const must = [
+    { term: { 'event.type': componentName } },
+    { range: { '@timestamp': { gte: from, lte: to } } }
+  ];
+  if (level !== 'all') must.unshift({ term: { 'log.level': level } });
+
+  return getLogsClient().search({
+    index: '.ds-cds-api-prod-logs-*',
+    body: {
+      size: 0,
+      query: { bool: { must } },
+      aggs: {
+        over_time: { date_histogram: { field: '@timestamp', fixed_interval: '30m', min_doc_count: 0 } },
+        total: { value_count: { field: '@timestamp' } }
+      }
+    }
+  });
+}
+
+export async function queryRequestVolume(componentName, from, to) {
+  const escaped = componentName.replace(/[.?+*|{}[\]()"\\]/g, '\\$&');
+  return getLogsClient().search({
+    index: '.ds-cds-api-prod-logs-*',
+    body: {
+      size: 0,
+      query: {
+        bool: {
+          must: [
+            { term: { 'log.level': 'info' } },
+            { regexp: { 'message.keyword': `.*componentTypes=([^&]*,)?${escaped}(,[^& ]*)?.*` } },
+            { range: { '@timestamp': { gte: from, lte: to } } }
+          ]
+        }
+      },
+      aggs: { over_time: { date_histogram: { field: '@timestamp', fixed_interval: '1h', min_doc_count: 0 } } }
+    }
+  });
+}
+
+export async function queryWebVitals(componentName, from, to) {
+  return getRumClient().search({
+    index: 'sns-traffic-c1-prod*',
+    body: {
+      size: 0,
+      query: {
+        bool: {
+          must: [
+            { term: { 'customProps.media_library.componentType': componentName } },
+            { range: { '@timestamp': { gte: from, lte: to } } }
+          ]
+        }
+      },
+      aggs: {
+        over_time: {
+          date_histogram: { field: '@timestamp', fixed_interval: '1h', min_doc_count: 0 },
+          aggs: {
+            lcp_p75: { percentiles: { field: 'lcp', percents: [75] } },
+            cls_p75: { percentiles: { field: 'cls', percents: [75] } },
+            inp_p75: { percentiles: { field: 'inp', percents: [75] } }
+          }
+        }
+      }
+    }
+  });
+}
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add clients/elasticsearch.js test/clients/elasticsearch.test.js
+git commit -m "feat: elasticsearch client with log level filter support"
+```
+
+---
+
+## Task 15: Analytics API Routes (with Level Filter)
+
+**Files:**
+- Create: `routes/analytics.js`
+- Create: `test/routes/analytics.test.js`
+- Create: `components/charts/ErrorsOverTime.js`
+- Create: `components/charts/RequestVolume.js`
+- Create: `components/charts/WebVitals.js`
+- Create: `components/charts/MiniChart.js`
+- Create: `pages/analytics.js`
+
+The `/api/analytics/errors` route accepts an optional `level` query param (default `'error'`). All chart components are created here since they're shared across pages.
+
+- [ ] **Step 1: Write failing tests**
+
+```js
+// test/routes/analytics.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockQueryErrors = jest.fn().mockResolvedValue({
+  hits: { total: { value: 12 } },
+  aggregations: { over_time: { buckets: [] } }
+});
+
+jest.unstable_mockModule('../../clients/elasticsearch.js', () => ({
+  queryErrors: mockQueryErrors,
+  queryRequestVolume: jest.fn().mockResolvedValue({ aggregations: { over_time: { buckets: [] } } }),
+  queryWebVitals: jest.fn().mockResolvedValue({ aggregations: { over_time: { buckets: [] } } })
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/analytics.js');
+const app = express();
+app.use(router);
+
+test('GET /api/analytics/errors passes level=error by default', async () => {
+  await request(app).get('/api/analytics/errors?component=myComp&from=now-1d&to=now');
+  expect(mockQueryErrors).toHaveBeenCalledWith('myComp', 'now-1d', 'now', 'error');
+});
+
+test('GET /api/analytics/errors passes level=all when specified', async () => {
+  await request(app).get('/api/analytics/errors?component=myComp&from=now-1d&to=now&level=all');
+  expect(mockQueryErrors).toHaveBeenCalledWith('myComp', 'now-1d', 'now', 'all');
+});
+
+test('GET /api/analytics/errors returns total and buckets', async () => {
+  const res = await request(app).get('/api/analytics/errors?component=myComp');
+  expect(res.status).toBe(200);
+  expect(res.body).toHaveProperty('total');
+  expect(res.body).toHaveProperty('buckets');
+});
+
+test('GET /api/analytics/volume returns buckets', async () => {
+  const res = await request(app).get('/api/analytics/volume?component=myComp');
+  expect(res.status).toBe(200);
+  expect(res.body).toHaveProperty('buckets');
+});
+
+test('GET /api/analytics/vitals returns buckets', async () => {
+  const res = await request(app).get('/api/analytics/vitals?component=myComp');
+  expect(res.status).toBe(200);
+  expect(res.body).toHaveProperty('buckets');
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+- [ ] **Step 3: Create routes/analytics.js**
+
+```js
+// routes/analytics.js
+import express from 'express';
+import { queryErrors, queryRequestVolume, queryWebVitals } from '../clients/elasticsearch.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+
+const router = express.Router();
+
+router.get('/api/analytics/errors', requireJomax, async (req, res, next) => {
+  try {
+    const { component, from = 'now-1d', to = 'now', level = 'error' } = req.query;
+    const result = await queryErrors(component, from, to, level);
+    res.json({
+      total: result.hits.total.value,
+      buckets: result.aggregations.over_time.buckets.map(b => ({ time: b.key_as_string, count: b.doc_count }))
+    });
+  } catch (err) { next(err); }
+});
+
+router.get('/api/analytics/volume', requireJomax, async (req, res, next) => {
+  try {
+    const { component, from = 'now-1d', to = 'now' } = req.query;
+    const result = await queryRequestVolume(component, from, to);
+    res.json({ buckets: result.aggregations.over_time.buckets.map(b => ({ time: b.key_as_string, count: b.doc_count })) });
+  } catch (err) { next(err); }
+});
+
+router.get('/api/analytics/vitals', requireJomax, async (req, res, next) => {
+  try {
+    const { component, from = 'now-1d', to = 'now' } = req.query;
+    const result = await queryWebVitals(component, from, to);
+    res.json({
+      buckets: result.aggregations.over_time.buckets.map(b => ({
+        time: b.key_as_string,
+        lcp_p75: b.lcp_p75?.values?.['75.0'] ?? null,
+        cls_p75: b.cls_p75?.values?.['75.0'] ?? null,
+        inp_p75: b.inp_p75?.values?.['75.0'] ?? null
+      }))
+    });
+  } catch (err) { next(err); }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create chart components**
+
+```jsx
+// components/charts/ErrorsOverTime.js
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
+
+export default function ErrorsOverTime({ data, deployedAt }) {
+  return (
+    <ResponsiveContainer width="100%" height={200}>
+      <LineChart data={data}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis dataKey="time" tick={{ fontSize: 11 }} />
+        <YAxis allowDecimals={false} />
+        <Tooltip />
+        {deployedAt && <ReferenceLine x={deployedAt} stroke="#f56565" strokeDasharray="4 2" label={{ value: 'Deploy', position: 'top', fontSize: 11 }} />}
+        <Line type="monotone" dataKey="count" stroke="#e53e3e" dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+```jsx
+// components/charts/RequestVolume.js
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
+
+export default function RequestVolume({ data, deployedAt }) {
+  return (
+    <ResponsiveContainer width="100%" height={200}>
+      <LineChart data={data}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis dataKey="time" tick={{ fontSize: 11 }} />
+        <YAxis allowDecimals={false} />
+        <Tooltip />
+        {deployedAt && <ReferenceLine x={deployedAt} stroke="#f56565" strokeDasharray="4 2" label={{ value: 'Deploy', position: 'top', fontSize: 11 }} />}
+        <Line type="monotone" dataKey="count" stroke="#38a169" dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+```jsx
+// components/charts/WebVitals.js
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine } from 'recharts';
+
+export default function WebVitals({ data, deployedAt }) {
+  return (
+    <ResponsiveContainer width="100%" height={250}>
+      <LineChart data={data}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis dataKey="time" tick={{ fontSize: 11 }} />
+        <YAxis />
+        <Tooltip />
+        <Legend />
+        {deployedAt && <ReferenceLine x={deployedAt} stroke="#f56565" strokeDasharray="4 2" label={{ value: 'Deploy', position: 'top', fontSize: 11 }} />}
+        <Line type="monotone" dataKey="lcp_p75" name="LCP p75 (ms)" stroke="#3182ce" dot={false} />
+        <Line type="monotone" dataKey="inp_p75" name="INP p75 (ms)" stroke="#805ad5" dot={false} />
+        <Line type="monotone" dataKey="cls_p75" name="CLS p75" stroke="#d69e2e" dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+```jsx
+// components/charts/MiniChart.js
+import { LineChart, Line, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
+
+export default function MiniChart({ data, dataKey, color, label, unit = '' }) {
+  const latest = data?.length ? data[data.length - 1][dataKey] : null;
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: 4, padding: 12 }}>
+      <div style={{ fontSize: 11, color: '#666', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 'bold', marginBottom: 4 }}>
+        {latest != null ? `${Math.round(latest)}${unit}` : '—'}
+      </div>
+      <ResponsiveContainer width="100%" height={60}>
+        <LineChart data={data}>
+          <YAxis hide domain={['auto', 'auto']} />
+          <Tooltip />
+          <Line type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Create pages/analytics.js** (standalone analytics page)
+
+```jsx
+// pages/analytics.js
+import { useState, useEffect } from 'react';
+import Layout from '../components/Layout.js';
+import ErrorsOverTime from '../components/charts/ErrorsOverTime.js';
+import RequestVolume from '../components/charts/RequestVolume.js';
+import WebVitals from '../components/charts/WebVitals.js';
+
+const TIME_RANGES = [
+  { label: '1h', value: 'now-1h' },
+  { label: '6h', value: 'now-6h' },
+  { label: '24h', value: 'now-1d' },
+  { label: '7d', value: 'now-7d' }
+];
+
+function kibanaLink(baseUrl, kql) {
+  if (!baseUrl) return null;
+  return `${baseUrl}&_a=${encodeURIComponent(`(query:(language:kuery,query:'${kql}'))`)}`;
+}
+
+export default function Analytics() {
+  const [components, setComponents] = useState([]);
+  const [component, setComponent] = useState('');
+  const [range, setRange] = useState('now-1d');
+  const [errors, setErrors] = useState({ total: 0, buckets: [] });
+  const [volume, setVolume] = useState({ buckets: [] });
+  const [vitals, setVitals] = useState({ buckets: [] });
+  const [loading, setLoading] = useState(false);
+
+  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
+  const rumBase  = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
+
+  useEffect(() => {
+    fetch('/api/components?env=prod').then(r => r.json())
+      .then(items => {
+        const names = items.map(c => c.name);
+        setComponents(names);
+        if (names.length) setComponent(names[0]);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!component) return;
+    setLoading(true);
+    const p = `component=${component}&from=${range}&to=now`;
+    Promise.all([
+      fetch(`/api/analytics/errors?${p}`).then(r => r.json()),
+      fetch(`/api/analytics/volume?${p}`).then(r => r.json()),
+      fetch(`/api/analytics/vitals?${p}`).then(r => r.json())
+    ]).then(([e, v, w]) => { setErrors(e); setVolume(v); setVitals(w); setLoading(false); });
+  }, [component, range]);
+
+  return (
+    <Layout>
+      <div style={{ padding: 24 }}>
+        <h1>Analytics</h1>
+        <div style={{ display: 'flex', gap: 16, marginBottom: 24, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={component} onChange={e => setComponent(e.target.value)}>
+            {components.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {TIME_RANGES.map(r => (
+              <button key={r.value} onClick={() => setRange(r.value)}
+                style={{ fontWeight: range === r.value ? 'bold' : 'normal' }}>{r.label}</button>
+            ))}
+          </div>
+          {loading && <span style={{ color: '#999', fontSize: 13 }}>Loading…</span>}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3>Errors — {errors.total} total</h3>
+              {logsBase && <a href={kibanaLink(logsBase, `event.type:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+            </div>
+            <ErrorsOverTime data={errors.buckets} />
+          </div>
+          <div>
+            <h3>Request volume</h3>
+            <RequestVolume data={volume.buckets} />
+          </div>
+          <div style={{ gridColumn: '1 / -1' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3>Web Vitals (p75)</h3>
+              {rumBase && <a href={kibanaLink(rumBase, `customProps.media_library.componentType:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+            </div>
+            <WebVitals data={vitals.buckets} />
+          </div>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add routes/analytics.js test/routes/analytics.test.js components/charts/ pages/analytics.js
+git commit -m "feat: analytics API with level filter + chart components + analytics page"
+```
+
+---
+
+## Task 16: RUM Sub-page (with Deployment Markers)
+
+**Files:**
+- Create: `routes/rum.js`
+- Create: `test/routes/rum.test.js`
+- Create: `pages/components/[name]/rum.js`
+
+The RUM sub-page shows full Web Vitals charts (LCP/CLS/INP p75) with a vertical `ReferenceLine` at `metaData.updatedAt` — the last time the manifest was deployed. This lets engineers visually see if a deploy changed performance.
+
+- [ ] **Step 1: Write failing tests for routes/rum.js**
+
+```js
+// test/routes/rum.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsClient: jest.fn(() => ({ get: mockGet, put: mockPut, getHistory: jest.fn().mockResolvedValue([]) })),
+  getCdsAuthClient: jest.fn(() => ({ get: jest.fn().mockResolvedValue({ jomax: ['jroig'] }) }))
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/rum.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/components/:name/rum returns RUM config', async () => {
+  const rumConfig = { pollerInterval: 100, pollerTimeout: 60000, targetDomSelector: '[data-testid="header"]' };
+  mockGet.mockResolvedValue(rumConfig);
+  const res = await request(app).get('/api/components/componentA/rum?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual(rumConfig);
+});
+
+test('PUT /api/components/:name/rum updates RUM config', async () => {
+  mockPut.mockResolvedValue();
+  const rumConfig = { pollerInterval: 200, pollerTimeout: 30000 };
+  const res = await request(app)
+    .put('/api/components/componentA/rum?env=dev')
+    .send(rumConfig);
+  expect(res.status).toBe(200);
+  expect(mockPut).toHaveBeenCalledWith('registry.componentA.rum', rumConfig);
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+- [ ] **Step 3: Create routes/rum.js**
+
+```js
+// routes/rum.js
+import express from 'express';
+import { getCdsClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+
+const router = express.Router();
+
+router.get('/api/components/:name/rum', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const value = await getCdsClient(env).get(`registry.${req.params.name}.rum`);
+    if (value == null) return res.status(404).json({ error: 'RUM not configured' });
+    res.json(value);
+  } catch (err) { next(err); }
+});
+
+router.put('/api/components/:name/rum', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    await getCdsClient(env).put(`registry.${name}.rum`, req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.get('/api/components/:name/rum/history', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    const history = await getCdsClient(env).getHistory(`registry.${req.params.name}.rum`);
+    res.json(history ?? []);
+  } catch (err) { next(err); }
+});
+
+router.post('/api/components/:name/rum/rollback', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    await getCdsClient(env).put(`registry.${name}.rum`, req.body.value);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create pages/components/[name]/rum.js**
+
+```jsx
+// pages/components/[name]/rum.js
+// Full RUM Web Vitals charts with a deployment marker at metaData.updatedAt.
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/router';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import JsonEditor from '../../../components/JsonEditor.js';
+import WebVitals from '../../../components/charts/WebVitals.js';
+
+const TIME_RANGES = [
+  { label: '1h', value: 'now-1h' },
+  { label: '6h', value: 'now-6h' },
+  { label: '24h', value: 'now-1d' },
+  { label: '7d', value: 'now-7d' }
+];
+
+export default function RumPage() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+  const [range, setRange] = useState('now-1d');
+  const [vitals, setVitals] = useState({ buckets: [] });
+  const [deployedAt, setDeployedAt] = useState(null);
+  const [rumConfig, setRumConfig] = useState(null);
+  const [editorValue, setEditorValue] = useState('');
+  const [editorValid, setEditorValid] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!name) return;
+    fetch(`/api/components/${name}?env=${env}`).then(r => r.json())
+      .then(m => setDeployedAt(m?.metaData?.updatedAt ?? null));
+    fetch(`/api/components/${name}/rum?env=${env}`).then(r => r.ok ? r.json() : null)
+      .then(cfg => { if (cfg) { setRumConfig(cfg); setEditorValue(JSON.stringify(cfg, null, 2)); } });
+  }, [name, env]);
+
+  useEffect(() => {
+    if (!name) return;
+    fetch(`/api/analytics/vitals?component=${name}&from=${range}&to=now`)
+      .then(r => r.json()).then(setVitals);
+  }, [name, env, range]);
+
+  async function saveRum() {
+    setSaving(true);
+    await fetch(`/api/components/${name}/rum?env=${env}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: editorValue
+    });
+    setSaving(false);
+  }
+
+  const rumBase = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
+  const kibanaLink = rumBase && name
+    ? `${rumBase}&_a=${encodeURIComponent(`(query:(language:kuery,query:'customProps.media_library.componentType:"${name}"'))`)}`
+    : null;
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
+        {name && <ComponentNav name={name} env={env} />}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {TIME_RANGES.map(r => (
+              <button key={r.value} onClick={() => setRange(r.value)}
+                style={{ fontWeight: range === r.value ? 'bold' : 'normal' }}>{r.label}</button>
+            ))}
+          </div>
+          {kibanaLink && <a href={kibanaLink} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: '#0070d2' }}>Open in Kibana →</a>}
+        </div>
+
+        {deployedAt && (
+          <p style={{ fontSize: 12, color: '#555', marginBottom: 12 }}>
+            Red line = last deploy ({new Date(deployedAt).toLocaleString()})
+          </p>
+        )}
+        <WebVitals data={vitals.buckets} deployedAt={deployedAt} />
+
+        <h3 style={{ marginTop: 32 }}>RUM Poller Config</h3>
+        {!rumConfig && <p style={{ color: '#999' }}>Not configured yet.</p>}
+        <JsonEditor value={editorValue} onChange={v => setEditorValue(v ?? '')}
+          onValidate={setEditorValid} height="200px" />
+        <button onClick={saveRum} disabled={!editorValid || saving} style={{ marginTop: 8 }}>
+          {saving ? 'Saving…' : 'Save RUM Config'}
+        </button>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add routes/rum.js test/routes/rum.test.js pages/components/
+git commit -m "feat: RUM sub-page with deployment markers + RUM config editor"
+```
+
+---
+
+## Task 17: Logs Sub-page (Log Level Filter + Deployment Markers)
+
+**Files:**
+- Create: `pages/components/[name]/logs.js`
+
+The log level filter persists per-component in localStorage using key `cds-admin:logLevel:{name}`. Default is `error`. On change, it immediately re-fetches chart data and updates localStorage. Deployment marker at `metaData.updatedAt`.
+
+- [ ] **Step 1: Create pages/components/[name]/logs.js**
+
+```jsx
+// pages/components/[name]/logs.js
+// Error/log charts with localStorage log-level filter (default: 'error').
+// Key: cds-admin:logLevel:{name} — per-component so users with many components
+// can have different preferences without conflicts.
+// Shows a vertical deployment marker at metaData.updatedAt.
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/router';
+import Layout from '../../../components/Layout.js';
+import ComponentNav from '../../../components/ComponentNav.js';
+import ErrorsOverTime from '../../../components/charts/ErrorsOverTime.js';
+import RequestVolume from '../../../components/charts/RequestVolume.js';
+
+const TIME_RANGES = [
+  { label: '1h', value: 'now-1h' },
+  { label: '6h', value: 'now-6h' },
+  { label: '24h', value: 'now-1d' },
+  { label: '7d', value: 'now-7d' }
+];
+const LOG_LEVELS = ['error', 'warn', 'info', 'all'];
+
+function getStoredLevel(componentName) {
+  try { return localStorage.getItem(`cds-admin:logLevel:${componentName}`) ?? 'error'; }
+  catch { return 'error'; }
+}
+function storeLevel(componentName, level) {
+  try { localStorage.setItem(`cds-admin:logLevel:${componentName}`, level); } catch {}
+}
+
+export default function LogsPage() {
+  const router = useRouter();
+  const { name } = router.query;
+  const [env, setEnv] = useState(router.query.env || 'dev');
+  const [range, setRange] = useState('now-1d');
+  const [level, setLevel] = useState('error');
+  const [errors, setErrors] = useState({ total: 0, buckets: [] });
+  const [volume, setVolume] = useState({ buckets: [] });
+  const [deployedAt, setDeployedAt] = useState(null);
+
+  // Load stored level once name is known
+  useEffect(() => {
+    if (!name) return;
+    setLevel(getStoredLevel(name));
+  }, [name]);
+
+  useEffect(() => {
+    if (!name) return;
+    fetch(`/api/components/${name}?env=${env}`).then(r => r.json())
+      .then(m => setDeployedAt(m?.metaData?.updatedAt ?? null));
+  }, [name, env]);
+
+  useEffect(() => {
+    if (!name) return;
+    const p = `component=${name}&from=${range}&to=now&level=${level}`;
+    fetch(`/api/analytics/errors?${p}`).then(r => r.json()).then(setErrors);
+    fetch(`/api/analytics/volume?component=${name}&from=${range}&to=now`).then(r => r.json()).then(setVolume);
+  }, [name, env, range, level]);
+
+  function handleLevelChange(newLevel) {
+    setLevel(newLevel);
+    if (name) storeLevel(name, newLevel);
+  }
+
+  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
+  const kibanaLink = logsBase && name
+    ? `${logsBase}&_a=${encodeURIComponent(`(query:(language:kuery,query:'event.type:"${name}"'))`)}`
+    : null;
+
+  return (
+    <Layout env={env} onEnvChange={e => { setEnv(e); router.replace({ query: { ...router.query, env: e } }); }}>
+      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+        <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+        <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
+        {name && <ComponentNav name={name} env={env} />}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 13, color: '#555' }}>Level:</span>
+            {LOG_LEVELS.map(l => (
+              <button key={l} onClick={() => handleLevelChange(l)}
+                style={{ fontWeight: level === l ? 'bold' : 'normal',
+                  background: level === l ? '#eef' : undefined, borderRadius: 4, padding: '4px 10px' }}>
+                {l}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {TIME_RANGES.map(r => (
+              <button key={r.value} onClick={() => setRange(r.value)}
+                style={{ fontWeight: range === r.value ? 'bold' : 'normal' }}>{r.label}</button>
+            ))}
+          </div>
+          {kibanaLink && <a href={kibanaLink} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: '#0070d2' }}>Open in Kibana →</a>}
+        </div>
+
+        {deployedAt && (
+          <p style={{ fontSize: 12, color: '#555', marginBottom: 12 }}>
+            Red line = last deploy ({new Date(deployedAt).toLocaleString()})
+          </p>
+        )}
+
+        <div style={{ marginBottom: 32 }}>
+          <h3 style={{ marginBottom: 8 }}>Log events — {errors.total} total</h3>
+          <ErrorsOverTime data={errors.buckets} deployedAt={deployedAt} />
+        </div>
+
+        <div>
+          <h3 style={{ marginBottom: 8 }}>Request volume</h3>
+          <RequestVolume data={volume.buckets} deployedAt={deployedAt} />
+        </div>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 2: Verify in browser** — navigate to `/components/{name}/logs`, change level, confirm localStorage persists across reload, verify deploy marker appears if component has `metaData.updatedAt`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add pages/components/
+git commit -m "feat: logs sub-page with localStorage level filter and deployment markers"
+```
+
+---
+
+## Task 18: Connect-gd-auth Wiring + _app.js Auth Gate
+
+**Files:**
+- Modify: `pages/_app.js`
+- Modify: `gasket.js` (add express middleware)
+
+- [ ] **Step 1: Add connect-gd-auth middleware to gasket.js**
+
+`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register it via an async plugin hook.
+
+```js
+// Add to the TOP of gasket.js (alongside other imports):
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const gdAuth = require('connect-gd-auth');
+
+// Add to the plugins array:
+{
+  name: 'cds-admin-auth',
+  hooks: {
+    async middleware(gasket) {
+      const { auth = {} } = gasket.config;
+      return [
+        gdAuth({
+          appName: 'cds-admin',
+          verify: gdAuth.risk.low,
+          types: ['jomax'],
+          auth: ['basic'],
+          host: auth.host,
+          ssoRedirect: auth.ssoRedirect
+        })
+      ];
+    }
+  }
+}
+```
+
+- [ ] **Step 2: Implement pages/_app.js auth gate**
+
+```jsx
+// pages/_app.js
+// When /auth/me returns 401, reload — the server-side connect-gd-auth middleware
+// will redirect the browser to SSO.
+import { useEffect, useState } from 'react';
+
+export default function App({ Component, pageProps }) {
+  const [authed, setAuthed] = useState(null);
+  useEffect(() => {
+    fetch('/auth/me').then(res => {
+      if (res.status === 401) window.location.reload();
+      else setAuthed(true);
+    });
+  }, []);
+
+  if (authed === null) return null;
+  return <Component {...pageProps} />;
+}
+```
+
+- [ ] **Step 3: Add `NEXT_PUBLIC_HOSTNAME` to `.env.local.example`**
+
+```bash
+NEXT_PUBLIC_HOSTNAME=cds-admin.int.test-gdcorp.tools
+```
+
+- [ ] **Step 4: Verify auth gate in browser** — navigate to `http://localhost:3000` without an SSO cookie, confirm redirect to SSO.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pages/_app.js gasket.js
+git commit -m "feat: connect-gd-auth SSO gate"
+```
+
+---
+
+## Verification Checklist
+
+- [ ] `npm run local` — dev server starts, AWS SSO check passes
+- [ ] `npm test` — all tests pass
+- [ ] `/` — list loads with `lastUpdated` column; search filters case-insensitively; alpha-sorted
+- [ ] As regular user, list shows ONLY components you're allowlisted on; super-admin sees all
+- [ ] `/components/new` — create a test component; cds-auth entry has `{ jomax: [''], cert: [''], awsiam: [''] }` (not creator's username)
+- [ ] `/components/{name}` (main page) — sparklines load; notes textarea auto-saves; tab bar renders with all 6 tabs
+- [ ] `/components/{name}/manifest` — JSON editor validates live; Save works; History/Rollback work; i18n hash saves; Slack test fires
+- [ ] `/components/{name}/auth` — add/remove jomax users; last-user removal blocked; "How cds-auth works →" links to docs; cert/awsiam show read-only
+- [ ] `/docs/cds-auth` — page renders explaining jomax/cert/awsiam
+- [ ] `/components/{name}/rum` — Web Vitals charts with deployment marker; RUM config editor saves
+- [ ] `/components/{name}/logs` — level filter changes chart (error/warn/info/all); filter persists in localStorage after page reload; deployment marker visible; request volume chart renders
+- [ ] `/components/{name}/sync` — Copy prod→test; allowlist checked on DESTINATION env
+- [ ] `/analytics` — component dropdown, time ranges, full charts
+- [ ] Each sub-page URL is directly linkable (test by opening in incognito after SSO)
+- [ ] Deploy to Katana dev — IAM writes succeed without cert env vars
+
+---
+
+## Revision Notes
+
+**v4 changes (tabbed multi-page architecture):**
+
+- **Tabbed sub-pages** — Component detail is now 6 deep-linkable pages: main (sparklines + notes), manifest, auth, rum, logs, sync. `ComponentNav` tab bar shared across all. Previous single-page dashboard design dropped.
+- **`lastUpdated` on list page** — `GET /api/components` now returns `[{ name, lastUpdated }]` instead of `[name]`. List page shows a "Last updated" column.
+- **cds-auth default changed** — New components get `{ jomax: [''], cert: [''], awsiam: [''] }` (not `{ jomax: [accountName], ... }`). Creator must explicitly add themselves on the Auth tab.
+- **Log level filter** — Logs sub-page has error/warn/info/all filter. Persisted per-component in localStorage as `cds-admin:logLevel:{name}`. API route accepts `?level=` param forwarded to `queryErrors`.
+- **Deployment markers** — RUM and Logs sub-pages fetch `metaData.updatedAt` and render a `ReferenceLine` on all charts so engineers can correlate releases with performance changes.
+- **cds-auth docs page** — `/docs/cds-auth` explains jomax/cert/awsiam auth types; linked from Auth sub-page.
+- **Accessibility improvements** — `AccessList` component now shows cert and awsiam as read-only sections (previously only jomax was shown).
+- **`queryErrors` level param** — `clients/elasticsearch.js` `queryErrors()` now accepts `level` as 4th arg; `'all'` omits the log.level term filter.
+
+**v3 changes (single-page dashboard + access control):**
+
+- **Notes feature** — `registry.{name}.notes` (plain text, no history). `routes/notes.js`, `components/Notes.js` with debounced auto-save.
+- **Super-admin bypass** — `cds-admin.admins` Switchboard key. Not editable via the app.
+- **Read access gating** — reads now require allowlist membership (or super-admin). `lib/access-control.js` exposes `isSuperAdmin`, `canAccess`, `assertCanAccess`, `listAccessibleComponents`.
+- **Component list filtering** — `GET /api/components` filters to components the caller can access.
+
+**v2 fixes:**
+- Jest ESM: `jest.unstable_mockModule()` instead of `jest.mock()`
+- Sync allowlist check moved to `toEnv`
+- Last-user lockout prevention
+- CSRF: `require-same-origin.js` middleware
+- Central error handler: `middleware/error-handler.js`
+- `JsonEditor` stale closure fix: separate `onChange` and `onValidate` props
+- Request volume ES query: `message.keyword` regex
 
 - [ ] **Step 1: Add test**
 
