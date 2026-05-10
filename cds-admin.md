@@ -13,7 +13,7 @@ This tool is a web app for CDS component owners. It lives at `cds-admin.int.{env
 - **Manifest** (`/components/{name}/manifest`): Monaco JSON editor + history/rollback + i18n version hash + Slack webhook config
 - **Auth** (`/components/{name}/auth`): Jomax/cert/awsiam allowlist management with link to cds-auth docs
 - **RUM** (`/components/{name}/rum`): Full Web Vitals charts (LCP/CLS/INP p75) with deployment event markers (from `metaData.updatedAt`)
-- **Logs** (`/components/{name}/logs`): Error/log charts with log-level filter (error/warn/info/all; persisted in localStorage per component using key `cds-admin:logLevel:{name}`) plus deployment markers
+- **Logs** (`/components/{name}/logs`): Error/log charts with log-level filter (error/warn/info/all; persisted in localStorage per component using key `cds-admin:logLevel:{name}`), deployment markers, **raw log table** (last 100 entries: timestamp, level, message, consuming app, page URL), **errors-by-shopper breakdown** (top shoppers by error count, from `client.user.id` terms aggregation), and a "Open in Kibana Discover →" deep-link
 - **Sync** (`/components/{name}/sync`): Copy manifests across environments (dev/test/prod)
 
 **Component list** — Alphabetically sorted, case-insensitive search. Shows `lastUpdated` (from `metaData.updatedAt`) per component. Each user only sees components they have access to. Super-admins (managed via a Switchboard key, not the app) see everything.
@@ -77,7 +77,7 @@ cds-admin/
 │   ├── notes.js                     # registry.{name}.notes: get, put (plain text, no history)
 │   ├── access.js                    # cds-auth {name}: get, put jomax array
 │   ├── alerts.js                    # cds-admin config.{name}: get, put, test
-│   └── analytics.js                 # ES proxy: errors, volume, rum vitals
+│   └── analytics.js                 # ES proxy: errors, volume, rum vitals, raw logs, errors-by-user
 ├── pages/
 │   ├── _app.js                      # Auth gate — redirects to SSO if no jomax session
 │   ├── index.js                     # Component list (filtered to user's access; shows lastUpdated)
@@ -91,7 +91,8 @@ cds-admin/
 │   │       ├── logs.js              # Error/log charts + localStorage log-level filter + markers
 │   │       └── sync.js              # Environment sync panel (dev/test/prod copy)
 │   ├── docs/
-│   │   └── cds-auth.js              # Static: explains jomax/cert/awsiam auth types
+│   │   ├── cds-auth.js              # Static: explains jomax/cert/awsiam auth types
+│   │   └── elasticsearch.js         # Static: explains logs + RUM clusters, fields, example docs
 │   └── analytics.js                 # Full analytics page (time ranges, deeper dive)
 ├── components/
 │   ├── Layout.js                    # Shell: nav, env selector, user display
@@ -146,6 +147,93 @@ cds-admin/
 |-----|-------|-------------|
 | `config.{name}` | `{ slackWebhookUrl: string \| null }` | Per-component Slack config |
 | `admins` | `{ jomax: ["jroig", "tbogart", ...] }` | **Super-admins** — read/write ANY component. Edited directly in Switchboard (not via the app). |
+
+## Elasticsearch Data Sources
+
+The app reads from two separate Elasticsearch clusters. Both are **read-only** from the app's perspective — the clusters are written by `cds-loader` and the RUM poller, not by this admin tool. API keys stay server-side; the browser only hits `/api/analytics/*` proxy routes.
+
+### Logs cluster — `.ds-cds-api-prod-logs-*`
+
+**Connection:** `ELASTICSEARCH_LOGS_URL` + `ELASTICSEARCH_LOGS_API_KEY`
+
+Captures every CDS API call and error. Written by `cds-loader` when components are loaded on consumer pages.
+
+**Key fields used in this app:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `@timestamp` | date | When the event occurred |
+| `event.type` | keyword | Component name (e.g. `bamMediaManagerEsm`) — **primary filter for all log queries** |
+| `log.level` | keyword | `error`, `warn`, `info` |
+| `message` | text | Log message body |
+| `error.stack_trace` | text | Stack trace (present on error-level entries only) |
+| `service.name` | keyword | Consuming app that loaded the component (e.g. `websites-godaddy`) |
+| `http.request.referrer` | keyword | Page URL where the component was loaded |
+| `client.user.id` | keyword | Shopper ID — used for errors-by-shopper aggregation |
+
+**Queries that use this cluster:**
+- `queryErrors(componentName, from, to, level)` — `date_histogram` agg filtered by `event.type` + optional `log.level`
+- `queryRequestVolume(componentName, from, to)` — `date_histogram` agg on info-level entries matching `componentTypes=` in the message
+- `queryRawLogs(componentName, from, to, level, size)` — top-N hits sorted `@timestamp desc`, source-filtered to the 7 fields above
+- `queryErrorsByUser(componentName, from, to)` — `terms` agg on `client.user.id`, top 10 by count
+
+**Example document:**
+```json
+{
+  "@timestamp": "2026-01-15T14:23:11.042Z",
+  "event": { "type": "bamMediaManagerEsm" },
+  "log": { "level": "error" },
+  "message": "Failed to load module: network timeout after 3000ms",
+  "error": { "stack_trace": "Error: network timeout\n  at fetch (/cds-loader/src/loader.js:142:11)" },
+  "service": { "name": "websites-godaddy" },
+  "http": { "request": { "referrer": "https://www.godaddy.com/domains/domain-name-search" } },
+  "client": { "user": { "id": "shopper-82a4f1c3" } }
+}
+```
+
+### RUM cluster — `sns-traffic-c1-prod*`
+
+**Connection:** `ELASTICSEARCH_RUM_URL` + `ELASTICSEARCH_RUM_API_KEY`
+
+Captures Core Web Vitals measurements from real users. Written by the RUM poller that runs alongside each component on the page.
+
+**Key fields used in this app:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `@timestamp` | date | When the measurement was taken |
+| `customProps.media_library.componentType` | keyword | Component name — **primary filter** |
+| `lcp` | float | Largest Contentful Paint (ms) — lower is better, target < 2500ms |
+| `cls` | float | Cumulative Layout Shift (unitless) — lower is better, target < 0.1 |
+| `inp` | float | Interaction to Next Paint (ms) — lower is better, target < 200ms |
+
+**Queries that use this cluster:**
+- `queryWebVitals(componentName, from, to)` — `date_histogram` agg with nested `percentiles` sub-aggs for LCP/CLS/INP p75
+
+**Example document:**
+```json
+{
+  "@timestamp": "2026-01-15T14:23:15.890Z",
+  "customProps": {
+    "media_library": {
+      "componentType": "bamMediaManagerEsm"
+    }
+  },
+  "lcp": 1842.5,
+  "cls": 0.04,
+  "inp": 112.0
+}
+```
+
+### Kibana access
+
+Both clusters have Kibana instances. The `kibanaDiscover` config in `gasket.js` per environment provides:
+- `logsUrl` — base URL for the logs cluster's Kibana (different between prod and non-prod)
+- `logsDataViewId` — the data view ID to pre-select in Kibana Discover
+
+The `buildKibanaDiscoverUrl(kibanaDiscover, componentName, from, to)` helper on the Logs sub-page builds a full Rison-encoded Discover deep-link that pre-filters to the component and time range.
+
+---
 
 ## Access Control Model
 
@@ -205,6 +293,10 @@ export default makeGasket({
       kibanaDashboards: {
         logs: 'https://<logs-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
         rum:  'https://<rum-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      },
+      kibanaDiscover: {
+        logsUrl: 'https://usiessp-non-prod-usw2.kb.us-west-2.aws.found.io:9243',
+        logsDataViewId: 'b7078ea2-8474-4e6e-b55f-a1a51d1562a0'
       }
     },
     dev: {
@@ -214,6 +306,10 @@ export default makeGasket({
       kibanaDashboards: {
         logs: 'https://<logs-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
         rum:  'https://<rum-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      },
+      kibanaDiscover: {
+        logsUrl: 'https://usiessp-non-prod-usw2.kb.us-west-2.aws.found.io:9243',
+        logsDataViewId: 'b7078ea2-8474-4e6e-b55f-a1a51d1562a0'
       }
     },
     test: {
@@ -223,6 +319,10 @@ export default makeGasket({
       kibanaDashboards: {
         logs: 'https://<logs-cluster-test>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
         rum:  'https://<rum-cluster-test>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      },
+      kibanaDiscover: {
+        logsUrl: 'https://usiessp-non-prod-usw2.kb.us-west-2.aws.found.io:9243',
+        logsDataViewId: 'b7078ea2-8474-4e6e-b55f-a1a51d1562a0'
       }
     },
     prod: {
@@ -232,6 +332,10 @@ export default makeGasket({
       kibanaDashboards: {
         logs: 'https://<logs-cluster-prod>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
         rum:  'https://<rum-cluster-prod>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      },
+      kibanaDiscover: {
+        logsUrl: 'https://usiessp-prod-usw2.kb.us-west-2.aws.found.io:9243',
+        logsDataViewId: 'e43871e5-f314-4ca9-8eb9-697e1799095c'
       }
     }
   }
@@ -758,8 +862,8 @@ import express from 'express';
 const router = express.Router();
 
 router.get('/api/config', (req, res) => {
-  const { kibanaDashboards = {} } = req.app.config ?? {};
-  res.json({ kibanaDashboards });
+  const { kibanaDashboards = {}, kibanaDiscover = {} } = req.app.config ?? {};
+  res.json({ kibanaDashboards, kibanaDiscover });
 });
 
 export default router;
@@ -779,6 +883,10 @@ app.config = {
   kibanaDashboards: {
     logs: 'https://logs.kb.example.com/app/dashboards#/view/abc',
     rum:  'https://rum.kb.example.com/app/dashboards#/view/xyz'
+  },
+  kibanaDiscover: {
+    logsUrl: 'https://usiessp-prod-usw2.kb.us-west-2.aws.found.io:9243',
+    logsDataViewId: 'e43871e5-f314-4ca9-8eb9-697e1799095c'
   }
 };
 app.use(router);
@@ -790,13 +898,21 @@ test('GET /api/config returns kibanaDashboards', async () => {
   expect(res.body.kibanaDashboards.rum).toContain('rum.kb.example.com');
 });
 
-test('GET /api/config returns empty object when not configured', async () => {
+test('GET /api/config returns kibanaDiscover with logsUrl and logsDataViewId', async () => {
+  const res = await request(app).get('/api/config');
+  expect(res.status).toBe(200);
+  expect(res.body.kibanaDiscover.logsUrl).toContain('usiessp-prod-usw2');
+  expect(res.body.kibanaDiscover.logsDataViewId).toBe('e43871e5-f314-4ca9-8eb9-697e1799095c');
+});
+
+test('GET /api/config returns empty objects when not configured', async () => {
   const bare = express();
   bare.config = {};
   bare.use(router);
   const res = await request(bare).get('/api/config');
   expect(res.status).toBe(200);
   expect(res.body.kibanaDashboards).toEqual({});
+  expect(res.body.kibanaDiscover).toEqual({});
 });
 ```
 
@@ -2344,11 +2460,12 @@ git commit -m "feat: cds-auth access API + AccessList component"
 
 ---
 
-## Task 12: Auth Sub-page + Docs Page
+## Task 12: Auth Sub-page + Docs Pages
 
 **Files:**
 - Create: `pages/components/[name]/auth.js`
 - Create: `pages/docs/cds-auth.js`
+- Create: `pages/docs/elasticsearch.js`
 
 - [ ] **Step 1: Create pages/components/[name]/auth.js**
 
@@ -2441,13 +2558,116 @@ export default function CdsAuthDocs() {
 }
 ```
 
-- [ ] **Step 3: Verify in browser** — navigate to `/components/{name}/auth`, add/remove a user, click "How cds-auth works →".
+- [ ] **Step 3: Create pages/docs/elasticsearch.js**
 
-- [ ] **Step 4: Commit**
+```jsx
+// pages/docs/elasticsearch.js
+// Static reference page explaining the two Elasticsearch clusters and their key fields.
+// Linked from the Logs sub-page. Gives engineers a single place to understand
+// what data is available and how it's indexed, without needing to poke at the clusters.
+import Layout from '../../components/Layout.js';
+
+export default function ElasticsearchDocs() {
+  const logsExample = JSON.stringify({
+    '@timestamp': '2026-01-15T14:23:11.042Z',
+    'event': { 'type': 'bamMediaManagerEsm' },
+    'log': { 'level': 'error' },
+    'message': 'Failed to load module: network timeout after 3000ms',
+    'error': { 'stack_trace': 'Error: network timeout\n  at fetch (/cds-loader/src/loader.js:142:11)' },
+    'service': { 'name': 'websites-godaddy' },
+    'http': { 'request': { 'referrer': 'https://www.godaddy.com/domains/domain-name-search' } },
+    'client': { 'user': { 'id': 'shopper-82a4f1c3' } }
+  }, null, 2);
+
+  const rumExample = JSON.stringify({
+    '@timestamp': '2026-01-15T14:23:15.890Z',
+    'customProps': { 'media_library': { 'componentType': 'bamMediaManagerEsm' } },
+    'lcp': 1842.5,
+    'cls': 0.04,
+    'inp': 112.0
+  }, null, 2);
+
+  const pre = { background: '#f6f8fa', padding: 16, borderRadius: 4, overflow: 'auto', fontSize: 13 };
+  const dt = { marginTop: 12, fontWeight: 600 };
+  const dd = { marginLeft: 16, marginTop: 2, color: '#555' };
+
+  return (
+    <Layout>
+      <div style={{ padding: 24, maxWidth: 800, margin: '0 auto', lineHeight: 1.7 }}>
+        <a href="javascript:history.back()" style={{ fontSize: 12, color: '#666' }}>← Back</a>
+        <h1>Elasticsearch Data Sources</h1>
+        <p>
+          CDS Admin reads from two separate Elasticsearch clusters. Both are <strong>read-only</strong> from
+          the app's perspective — data is written by <code>cds-loader</code> and the RUM poller, not by this tool.
+          API keys stay server-side; the browser only hits <code>/api/analytics/*</code> proxy routes.
+        </p>
+
+        <h2>Logs cluster — <code>.ds-cds-api-prod-logs-*</code></h2>
+        <p>
+          Captures every CDS API call and error. Written by <code>cds-loader</code> when components are
+          loaded on consumer pages. This is the data behind the <strong>Logs sub-page</strong> charts,
+          raw log table, and errors-by-shopper breakdown.
+        </p>
+        <h3>Key fields</h3>
+        <dl>
+          <dt style={dt}><code>event.type</code></dt>
+          <dd style={dd}>Component name (e.g. <code>bamMediaManagerEsm</code>). <strong>Primary filter for all log queries.</strong></dd>
+          <dt style={dt}><code>log.level</code></dt>
+          <dd style={dd}><code>error</code>, <code>warn</code>, or <code>info</code>. The Logs page level-filter uses this field.</dd>
+          <dt style={dt}><code>message</code></dt>
+          <dd style={dd}>Log message body. For request-volume queries, the <code>message.keyword</code> field is regex-matched for <code>componentTypes=</code>.</dd>
+          <dt style={dt}><code>error.stack_trace</code></dt>
+          <dd style={dd}>Stack trace. Only present on <code>log.level: error</code> entries. Shown in the collapsible expander in the raw log table.</dd>
+          <dt style={dt}><code>service.name</code></dt>
+          <dd style={dd}>The consuming app that loaded the component (e.g. <code>websites-godaddy</code>). Shown as "App" in the log table.</dd>
+          <dt style={dt}><code>http.request.referrer</code></dt>
+          <dd style={dd}>The page URL where the component was loaded. Shown as "Page URL" in the log table.</dd>
+          <dt style={dt}><code>client.user.id</code></dt>
+          <dd style={dd}>Shopper ID. Used for the errors-by-shopper aggregation (<code>terms</code> agg, top 10 by count).</dd>
+        </dl>
+        <h3>Example document</h3>
+        <pre style={pre}>{logsExample}</pre>
+
+        <h2 style={{ marginTop: 32 }}>RUM cluster — <code>sns-traffic-c1-prod*</code></h2>
+        <p>
+          Captures Core Web Vitals measurements from real users. Written by the RUM poller that runs
+          alongside each component on the page. This is the data behind the <strong>RUM sub-page</strong>
+          charts and the Web Vitals sparklines on the main dashboard.
+        </p>
+        <h3>Key fields</h3>
+        <dl>
+          <dt style={dt}><code>customProps.media_library.componentType</code></dt>
+          <dd style={dd}>Component name. <strong>Primary filter for all RUM queries.</strong></dd>
+          <dt style={dt}><code>lcp</code></dt>
+          <dd style={dd}>Largest Contentful Paint in ms. Target: &lt; 2500ms. Shown as LCP p75.</dd>
+          <dt style={dt}><code>cls</code></dt>
+          <dd style={dd}>Cumulative Layout Shift (unitless). Target: &lt; 0.1. Shown as CLS p75.</dd>
+          <dt style={dt}><code>inp</code></dt>
+          <dd style={dd}>Interaction to Next Paint in ms. Target: &lt; 200ms. Shown as INP p75.</dd>
+        </dl>
+        <h3>Example document</h3>
+        <pre style={pre}>{rumExample}</pre>
+
+        <h2 style={{ marginTop: 32 }}>Kibana access</h2>
+        <p>
+          Both clusters have Kibana. The <code>kibanaDiscover</code> config in <code>gasket.js</code>
+          per environment provides the <code>logsUrl</code> and <code>logsDataViewId</code> used to build
+          Kibana Discover deep-links on the Logs sub-page. Dashboard deep-links use <code>kibanaDashboards.logs</code>
+          and <code>kibanaDashboards.rum</code>.
+        </p>
+      </div>
+    </Layout>
+  );
+}
+```
+
+- [ ] **Step 4: Verify in browser** — navigate to `/components/{name}/auth`, add/remove a user, click "How cds-auth works →"; navigate to `/docs/elasticsearch`, confirm both clusters, fields, and example docs render.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add pages/components/ pages/docs/
-git commit -m "feat: auth sub-page + cds-auth docs page"
+git commit -m "feat: auth sub-page + cds-auth + elasticsearch docs pages"
 ```
 
 ---
@@ -2650,7 +2870,7 @@ process.env.ELASTICSEARCH_LOGS_API_KEY = 'bG9nczp0ZXN0';
 process.env.ELASTICSEARCH_RUM_URL = 'https://rum.example.com';
 process.env.ELASTICSEARCH_RUM_API_KEY = 'cnVtOnRlc3Q=';
 
-const { getLogsClient, getRumClient, queryErrors, queryRequestVolume, queryWebVitals } = await import('../../clients/elasticsearch.js');
+const { getLogsClient, getRumClient, queryErrors, queryRequestVolume, queryWebVitals, queryRawLogs, queryErrorsByUser } = await import('../../clients/elasticsearch.js');
 
 test('getLogsClient returns singleton', () => {
   expect(getLogsClient()).toBe(getLogsClient());
@@ -2686,6 +2906,37 @@ test('queryWebVitals calls RUM cluster', async () => {
   await queryWebVitals('myComponent', 'now-1d', 'now');
   expect(mockRumSearch).toHaveBeenCalledWith(expect.objectContaining({
     index: 'sns-traffic-c1-prod*'
+  }));
+});
+
+test('queryRawLogs returns size 100 hits sorted desc', async () => {
+  mockLogsSearch.mockResolvedValueOnce({ hits: { hits: [] } });
+  await queryRawLogs('myComponent', 'now-1d', 'now', 'all', 100);
+  expect(mockLogsSearch).toHaveBeenCalledWith(expect.objectContaining({
+    body: expect.objectContaining({
+      size: 100,
+      sort: [{ '@timestamp': { order: 'desc' } }]
+    })
+  }));
+});
+
+test('queryRawLogs with level=error adds log.level filter', async () => {
+  mockLogsSearch.mockResolvedValueOnce({ hits: { hits: [] } });
+  await queryRawLogs('myComponent', 'now-1d', 'now', 'error');
+  const body = mockLogsSearch.mock.calls[mockLogsSearch.mock.calls.length - 1][0].body;
+  expect(body.query.bool.must).toEqual(expect.arrayContaining([{ term: { 'log.level': 'error' } }]));
+});
+
+test('queryErrorsByUser returns terms agg on client.user.id', async () => {
+  mockLogsSearch.mockResolvedValueOnce({
+    hits: { total: { value: 50 } },
+    aggregations: { by_user: { buckets: [{ key: 'shopper-123', doc_count: 30 }] } }
+  });
+  await queryErrorsByUser('myComponent', 'now-1d', 'now');
+  expect(mockLogsSearch).toHaveBeenCalledWith(expect.objectContaining({
+    body: expect.objectContaining({
+      aggs: { by_user: { terms: expect.objectContaining({ field: 'client.user.id', size: 10 }) } }
+    })
   }));
 });
 ```
@@ -2788,6 +3039,53 @@ export async function queryWebVitals(componentName, from, to) {
     }
   });
 }
+
+// Returns the last `size` raw log entries for a component, newest first.
+// Fields: @timestamp, log.level, message, error.stack_trace, service.name (consuming app),
+// http.request.referrer (page URL), client.user.id (shopperId).
+// level='all' omits the log.level filter.
+export async function queryRawLogs(componentName, from, to, level = 'all', size = 100) {
+  const must = [
+    { term: { 'event.type': componentName } },
+    { range: { '@timestamp': { gte: from, lte: to } } }
+  ];
+  if (level !== 'all') must.push({ term: { 'log.level': level } });
+
+  return getLogsClient().search({
+    index: '.ds-cds-api-prod-logs-*',
+    body: {
+      size,
+      _source: ['@timestamp', 'log.level', 'message', 'error.stack_trace', 'service.name', 'http.request.referrer', 'client.user.id'],
+      query: { bool: { must } },
+      sort: [{ '@timestamp': { order: 'desc' } }]
+    }
+  });
+}
+
+// Returns top shoppers (client.user.id) by error count for a component.
+// Useful for spotting if a small number of shoppers account for disproportionate errors.
+export async function queryErrorsByUser(componentName, from, to) {
+  return getLogsClient().search({
+    index: '.ds-cds-api-prod-logs-*',
+    body: {
+      size: 0,
+      query: {
+        bool: {
+          must: [
+            { term: { 'event.type': componentName } },
+            { term: { 'log.level': 'error' } },
+            { range: { '@timestamp': { gte: from, lte: to } } }
+          ]
+        }
+      },
+      aggs: {
+        by_user: {
+          terms: { field: 'client.user.id', size: 10, order: { _count: 'desc' } }
+        }
+      }
+    }
+  });
+}
 ```
 
 - [ ] **Step 4: Run tests — expect PASS**
@@ -2827,10 +3125,15 @@ const mockQueryErrors = jest.fn().mockResolvedValue({
   aggregations: { over_time: { buckets: [] } }
 });
 
+const mockQueryRawLogs = jest.fn().mockResolvedValue({ hits: { hits: [] } });
+const mockQueryErrorsByUser = jest.fn().mockResolvedValue({ aggregations: { by_user: { buckets: [] } } });
+
 jest.unstable_mockModule('../../clients/elasticsearch.js', () => ({
   queryErrors: mockQueryErrors,
   queryRequestVolume: jest.fn().mockResolvedValue({ aggregations: { over_time: { buckets: [] } } }),
-  queryWebVitals: jest.fn().mockResolvedValue({ aggregations: { over_time: { buckets: [] } } })
+  queryWebVitals: jest.fn().mockResolvedValue({ aggregations: { over_time: { buckets: [] } } }),
+  queryRawLogs: mockQueryRawLogs,
+  queryErrorsByUser: mockQueryErrorsByUser
 }));
 jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
@@ -2868,6 +3171,31 @@ test('GET /api/analytics/vitals returns buckets', async () => {
   expect(res.status).toBe(200);
   expect(res.body).toHaveProperty('buckets');
 });
+
+test('GET /api/analytics/logs returns entries array with expected fields', async () => {
+  mockQueryRawLogs.mockResolvedValueOnce({
+    hits: { hits: [{ _source: { '@timestamp': '2026-01-01T00:00:00Z', 'log.level': 'error', message: 'failed', 'service.name': 'myApp', 'http.request.referrer': 'https://example.com', 'client.user.id': 'shopper-abc' } }] }
+  });
+  const res = await request(app).get('/api/analytics/logs?component=myComp');
+  expect(res.status).toBe(200);
+  expect(res.body.entries).toHaveLength(1);
+  expect(res.body.entries[0]).toMatchObject({
+    timestamp: '2026-01-01T00:00:00Z',
+    level: 'error',
+    message: 'failed',
+    app: 'myApp',
+    shopperId: 'shopper-abc'
+  });
+});
+
+test('GET /api/analytics/errors-by-user returns shoppers array', async () => {
+  mockQueryErrorsByUser.mockResolvedValueOnce({
+    aggregations: { by_user: { buckets: [{ key: 'shopper-123', doc_count: 42 }] } }
+  });
+  const res = await request(app).get('/api/analytics/errors-by-user?component=myComp');
+  expect(res.status).toBe(200);
+  expect(res.body.shoppers).toEqual([{ shopperId: 'shopper-123', count: 42 }]);
+});
 ```
 
 - [ ] **Step 2: Run test — expect FAIL**
@@ -2877,7 +3205,7 @@ test('GET /api/analytics/vitals returns buckets', async () => {
 ```js
 // routes/analytics.js
 import express from 'express';
-import { queryErrors, queryRequestVolume, queryWebVitals } from '../clients/elasticsearch.js';
+import { queryErrors, queryRequestVolume, queryWebVitals, queryRawLogs, queryErrorsByUser } from '../clients/elasticsearch.js';
 import { requireJomax } from '../middleware/require-jomax.js';
 
 const router = express.Router();
@@ -2913,6 +3241,39 @@ router.get('/api/analytics/vitals', requireJomax, async (req, res, next) => {
         inp_p75: b.inp_p75?.values?.['75.0'] ?? null
       }))
     });
+  } catch (err) { next(err); }
+});
+
+// Returns last 100 raw log entries. level param (default 'all') filters by log.level.
+// Response shape: { entries: [{ timestamp, level, message, stackTrace, app, pageUrl, shopperId }] }
+router.get('/api/analytics/logs', requireJomax, async (req, res, next) => {
+  try {
+    const { component, from = 'now-1d', to = 'now', level = 'all' } = req.query;
+    const result = await queryRawLogs(component, from, to, level, 100);
+    const entries = result.hits.hits.map(h => ({
+      timestamp: h._source['@timestamp'],
+      level: h._source['log.level'],
+      message: h._source.message,
+      stackTrace: h._source['error.stack_trace'] ?? null,
+      app: h._source['service.name'] ?? null,
+      pageUrl: h._source['http.request.referrer'] ?? null,
+      shopperId: h._source['client.user.id'] ?? null
+    }));
+    res.json({ entries });
+  } catch (err) { next(err); }
+});
+
+// Returns top shoppers (client.user.id) by error count.
+// Response shape: { shoppers: [{ shopperId, count }] }
+router.get('/api/analytics/errors-by-user', requireJomax, async (req, res, next) => {
+  try {
+    const { component, from = 'now-1d', to = 'now' } = req.query;
+    const result = await queryErrorsByUser(component, from, to);
+    const shoppers = result.aggregations.by_user.buckets.map(b => ({
+      shopperId: b.key,
+      count: b.doc_count
+    }));
+    res.json({ shoppers });
   } catch (err) { next(err); }
 });
 
@@ -3340,21 +3701,28 @@ git commit -m "feat: RUM sub-page with deployment markers + RUM config editor"
 
 ---
 
-## Task 17: Logs Sub-page (Log Level Filter + Deployment Markers)
+## Task 17: Logs Sub-page (Charts + Raw Log Table + Shopper Breakdown)
 
 **Files:**
 - Create: `pages/components/[name]/logs.js`
 
-The log level filter persists per-component in localStorage using key `cds-admin:logLevel:{name}`. Default is `error`. On change, it immediately re-fetches chart data and updates localStorage. Deployment marker at `metaData.updatedAt`.
+The Logs sub-page has four sections:
+1. **Charts** — error rate over time + request volume, with level filter (error/warn/info/all), time range picker, and deployment marker
+2. **Errors by shopper** — top shoppers by error count from `queryErrorsByUser` (identifies if specific shoppers account for disproportionate errors)
+3. **Raw log entries** — last 100 entries from `queryRawLogs`: timestamp, level badge, message, consuming app (`service.name`), page URL (`http.request.referrer`), shopper ID (`client.user.id`)
+4. **Kibana Discover link** — deep-links directly to Kibana Discover pre-filtered to this component using `kibanaDiscover.logsUrl` + `logsDataViewId` from `/api/config`
+
+The `buildKibanaDiscoverUrl(kibanaDiscover, componentName, from, to)` helper builds the full Kibana Discover URL using the Rison-encoded `_g` and `_a` params matching the format from the prod cluster.
+
+Log level filter persists per-component in localStorage (`cds-admin:logLevel:{name}`), default `error`. Level change immediately refetches both chart data and raw entries. Time range picker (1h/6h/24h/7d) applies to charts; raw entries always show last 100 within the selected range.
 
 - [ ] **Step 1: Create pages/components/[name]/logs.js**
 
 ```jsx
 // pages/components/[name]/logs.js
-// Error/log charts with localStorage log-level filter (default: 'error').
-// Key: cds-admin:logLevel:{name} — per-component so users with many components
-// can have different preferences without conflicts.
-// Shows a vertical deployment marker at metaData.updatedAt.
+// Four sections: charts, errors-by-shopper, raw log table, Kibana Discover link.
+// Level filter (error/warn/info/all) persists in localStorage per component.
+// Deployment marker at metaData.updatedAt on charts.
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Layout from '../../../components/Layout.js';
@@ -3370,6 +3738,16 @@ const TIME_RANGES = [
 ];
 const LOG_LEVELS = ['error', 'warn', 'info', 'all'];
 
+// Builds the Kibana Discover deep-link URL. Matches the format used by the prod cluster:
+// https://{logsUrl}/app/discover#/?_g=(time:...)&_a=(dataSource:(dataViewId:{id},...),query:...,sort:...)
+function buildKibanaDiscoverUrl(kibanaDiscover, componentName, from, to) {
+  if (!kibanaDiscover?.logsUrl || !kibanaDiscover?.logsDataViewId) return null;
+  const { logsUrl, logsDataViewId } = kibanaDiscover;
+  const g = `(filters:!(),query:(language:kuery,query:''),refreshInterval:(pause:!t,value:60000),time:(from:${from},to:${to}))`;
+  const a = `(columns:!(),dataSource:(dataViewId:${logsDataViewId},type:dataView),filters:!(),hideChart:!f,interval:auto,query:(language:kuery,query:'event.type:${encodeURIComponent(`"${componentName}"`)}'),sort:!(!('@timestamp',desc)))`;
+  return `${logsUrl}/app/discover#/?_g=${encodeURIComponent(g)}&_a=${encodeURIComponent(a)}`;
+}
+
 function getStoredLevel(componentName) {
   try { return localStorage.getItem(`cds-admin:logLevel:${componentName}`) ?? 'error'; }
   catch { return 'error'; }
@@ -3377,6 +3755,8 @@ function getStoredLevel(componentName) {
 function storeLevel(componentName, level) {
   try { localStorage.setItem(`cds-admin:logLevel:${componentName}`, level); } catch {}
 }
+
+const LEVEL_COLORS = { error: '#c53030', warn: '#d69e2e', info: '#2b6cb0', all: '#555' };
 
 export default function LogsPage() {
   const router = useRouter();
@@ -3386,30 +3766,36 @@ export default function LogsPage() {
   const [level, setLevel] = useState('error');
   const [errors, setErrors] = useState({ total: 0, buckets: [] });
   const [volume, setVolume] = useState({ buckets: [] });
+  const [rawLogs, setRawLogs] = useState([]);
+  const [shoppers, setShoppers] = useState([]);
   const [deployedAt, setDeployedAt] = useState(null);
-  const [kibanaDashboards, setKibanaDashboards] = useState({});
+  const [kibanaDiscover, setKibanaDiscover] = useState({});
 
+  // Load config (kibanaDiscover) and level from localStorage once
   useEffect(() => {
-    fetch('/api/config').then(r => r.json()).then(d => setKibanaDashboards(d.kibanaDashboards ?? {}));
+    fetch('/api/config').then(r => r.json()).then(d => setKibanaDiscover(d.kibanaDiscover ?? {}));
   }, []);
 
-  // Load stored level once name is known
   useEffect(() => {
     if (!name) return;
     setLevel(getStoredLevel(name));
   }, [name]);
 
+  // Fetch last-deploy timestamp
   useEffect(() => {
     if (!name) return;
     fetch(`/api/components/${name}?env=${env}`).then(r => r.json())
       .then(m => setDeployedAt(m?.metaData?.updatedAt ?? null));
   }, [name, env]);
 
+  // Fetch charts + raw logs + shoppers whenever name/range/level changes
   useEffect(() => {
     if (!name) return;
-    const p = `component=${name}&from=${range}&to=now&level=${level}`;
-    fetch(`/api/analytics/errors?${p}`).then(r => r.json()).then(setErrors);
-    fetch(`/api/analytics/volume?component=${name}&from=${range}&to=now`).then(r => r.json()).then(setVolume);
+    const p = `component=${name}&from=${range}&to=now`;
+    fetch(`/api/analytics/errors?${p}&level=${level}`).then(r => r.json()).then(setErrors);
+    fetch(`/api/analytics/volume?${p}`).then(r => r.json()).then(setVolume);
+    fetch(`/api/analytics/logs?${p}&level=${level}`).then(r => r.json()).then(d => setRawLogs(d.entries ?? []));
+    fetch(`/api/analytics/errors-by-user?${p}`).then(r => r.json()).then(d => setShoppers(d.shoppers ?? []));
   }, [name, env, range, level]);
 
   function handleLevelChange(newLevel) {
@@ -3417,14 +3803,12 @@ export default function LogsPage() {
     if (name) storeLevel(name, newLevel);
   }
 
-  const kibanaLink = kibanaDashboards.logs && name
-    ? `${kibanaDashboards.logs}&_a=${encodeURIComponent(`(query:(language:kuery,query:'event.type:"${name}"'))`)}`
-    : null;
-
   function handleEnvChange(e) {
     setEnv(e);
     router.replace({ query: { ...router.query, env: e } });
   }
+
+  const kibanaLink = buildKibanaDiscoverUrl(kibanaDiscover, name, range, 'now');
 
   return (
     <Layout env={env} onEnvChange={handleEnvChange}>
@@ -3433,13 +3817,15 @@ export default function LogsPage() {
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
         {name && <ComponentNav name={name} env={env} />}
 
+        {/* Controls row */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <span style={{ fontSize: 13, color: '#555' }}>Level:</span>
             {LOG_LEVELS.map(l => (
               <button key={l} onClick={() => handleLevelChange(l)}
                 style={{ fontWeight: level === l ? 'bold' : 'normal',
-                  background: level === l ? '#eef' : undefined, borderRadius: 4, padding: '4px 10px' }}>
+                  background: level === l ? '#eef' : undefined, borderRadius: 4, padding: '4px 10px',
+                  color: level === l ? LEVEL_COLORS[l] : undefined }}>
                 {l}
               </button>
             ))}
@@ -3450,7 +3836,16 @@ export default function LogsPage() {
                 style={{ fontWeight: range === r.value ? 'bold' : 'normal' }}>{r.label}</button>
             ))}
           </div>
-          {kibanaLink && <a href={kibanaLink} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: '#0070d2' }}>Open in Kibana →</a>}
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+            {kibanaLink && (
+              <a href={kibanaLink} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: '#0070d2' }}>
+                Open in Kibana Discover →
+              </a>
+            )}
+            <a href="/docs/elasticsearch" target="_blank" style={{ fontSize: 13, color: '#888' }}>
+              Data sources
+            </a>
+          </div>
         </div>
 
         {deployedAt && (
@@ -3459,14 +3854,94 @@ export default function LogsPage() {
           </p>
         )}
 
+        {/* Charts */}
         <div style={{ marginBottom: 32 }}>
           <h3 style={{ marginBottom: 8 }}>Log events — {errors.total} total</h3>
           <ErrorsOverTime data={errors.buckets} deployedAt={deployedAt} />
         </div>
-
-        <div>
+        <div style={{ marginBottom: 32 }}>
           <h3 style={{ marginBottom: 8 }}>Request volume</h3>
           <RequestVolume data={volume.buckets} deployedAt={deployedAt} />
+        </div>
+
+        {/* Errors by shopper */}
+        {shoppers.length > 0 && (
+          <div style={{ marginBottom: 32 }}>
+            <h3 style={{ marginBottom: 8 }}>Errors by shopper (top {shoppers.length})</h3>
+            <table style={{ borderCollapse: 'collapse', width: '100%', maxWidth: 600 }}>
+              <thead>
+                <tr style={{ borderBottom: '2px solid #eee', fontSize: 12, color: '#666', textAlign: 'left' }}>
+                  <th style={{ padding: '4px 12px' }}>Shopper ID</th>
+                  <th style={{ padding: '4px 12px', textAlign: 'right' }}>Errors</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shoppers.map(({ shopperId, count }) => (
+                  <tr key={shopperId} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '6px 12px', fontFamily: 'monospace', fontSize: 13 }}>{shopperId || '(anonymous)'}</td>
+                    <td style={{ padding: '6px 12px', textAlign: 'right', fontWeight: 'bold' }}>{count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Raw log entries */}
+        <div>
+          <h3 style={{ marginBottom: 8 }}>Recent log entries ({rawLogs.length})</h3>
+          {rawLogs.length === 0 ? (
+            <p style={{ color: '#999' }}>No log entries for this filter.</p>
+          ) : (
+            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: '2px solid #eee', color: '#666', textAlign: 'left' }}>
+                  <th style={{ padding: '4px 8px', whiteSpace: 'nowrap' }}>Time</th>
+                  <th style={{ padding: '4px 8px' }}>Level</th>
+                  <th style={{ padding: '4px 8px' }}>Message</th>
+                  <th style={{ padding: '4px 8px' }}>App</th>
+                  <th style={{ padding: '4px 8px' }}>Shopper</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rawLogs.map((entry, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #f5f5f5', verticalAlign: 'top' }}>
+                    <td style={{ padding: '6px 8px', whiteSpace: 'nowrap', color: '#666' }}>
+                      {new Date(entry.timestamp).toLocaleString()}
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <span style={{
+                        display: 'inline-block', padding: '1px 6px', borderRadius: 3, fontSize: 11, fontWeight: 600,
+                        background: LEVEL_COLORS[entry.level] || '#888', color: '#fff'
+                      }}>{entry.level}</span>
+                    </td>
+                    <td style={{ padding: '6px 8px', maxWidth: 500 }}>
+                      <div style={{ fontFamily: 'monospace', wordBreak: 'break-word' }}>{entry.message}</div>
+                      {entry.stackTrace && (
+                        <details style={{ marginTop: 4 }}>
+                          <summary style={{ cursor: 'pointer', color: '#c53030', fontSize: 11 }}>Stack trace</summary>
+                          <pre style={{ margin: '4px 0', fontSize: 10, overflow: 'auto', background: '#fff5f5', padding: 6 }}>
+                            {entry.stackTrace}
+                          </pre>
+                        </details>
+                      )}
+                      {entry.pageUrl && (
+                        <div style={{ marginTop: 2, fontSize: 11, color: '#666', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                          {entry.pageUrl}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ padding: '6px 8px', fontFamily: 'monospace', whiteSpace: 'nowrap' }}>
+                      {entry.app ?? '—'}
+                    </td>
+                    <td style={{ padding: '6px 8px', fontFamily: 'monospace', whiteSpace: 'nowrap' }}>
+                      {entry.shopperId ?? '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </Layout>
@@ -3474,13 +3949,18 @@ export default function LogsPage() {
 }
 ```
 
-- [ ] **Step 2: Verify in browser** — navigate to `/components/{name}/logs`, change level, confirm localStorage persists across reload, verify deploy marker appears if component has `metaData.updatedAt`.
+- [ ] **Step 2: Verify in browser** — navigate to `/components/{name}/logs`:
+  - Change level — charts, shopper table, and raw entries all update
+  - Reload — level restores from localStorage
+  - Deploy marker appears when component has `metaData.updatedAt`
+  - "Open in Kibana Discover →" link opens pre-filtered to the component
+  - Stack trace expander works on entries with `error.stack_trace`
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add pages/components/
-git commit -m "feat: logs sub-page with localStorage level filter and deployment markers"
+git commit -m "feat: logs sub-page with raw entries table, shopper breakdown, Kibana Discover link"
 ```
 
 ---
@@ -3577,16 +4057,28 @@ git commit -m "feat: connect-gd-auth SSO gate"
 - [ ] `/components/{name}/manifest` — JSON editor validates live; Save works; History/Rollback work; i18n hash saves; Slack test fires
 - [ ] `/components/{name}/auth` — add/remove jomax users; last-user removal blocked; "How cds-auth works →" links to docs; cert/awsiam show read-only
 - [ ] `/docs/cds-auth` — page renders explaining jomax/cert/awsiam
-- [ ] `/components/{name}/rum` — Web Vitals charts with deployment marker; RUM config editor saves
-- [ ] `/components/{name}/logs` — level filter changes chart (error/warn/info/all); filter persists in localStorage after page reload; deployment marker visible; request volume chart renders
+- [ ] `/docs/cds-auth` — page renders explaining jomax/cert/awsiam
+- [ ] `/docs/elasticsearch` — page renders explaining logs cluster fields, RUM cluster fields, with example documents for each
+- [ ] `/components/{name}/rum` — Web Vitals charts with deployment marker at `metaData.updatedAt`; RUM config editor saves
+- [ ] `/components/{name}/logs` — level filter (error/warn/info/all) changes charts AND raw log entries; filter persists in localStorage after page reload; deployment marker visible; request volume chart renders; raw log table shows last 100 entries with timestamp, level badge, message, app, shopper ID; stack trace expander works on entries with `error.stack_trace`; errors-by-shopper table appears when shoppers have errors; "Open in Kibana Discover →" deep-link opens pre-filtered to the component; "Data sources" link opens `/docs/elasticsearch`
 - [ ] `/components/{name}/sync` — Copy prod→test; allowlist checked on DESTINATION env
-- [ ] `/analytics` — component dropdown, time ranges, full charts
-- [ ] Each sub-page URL is directly linkable (test by opening in incognito after SSO)
+- [ ] `/analytics` — component dropdown, time ranges, full charts, Kibana dashboard deep-links
+- [ ] Each sub-page URL is directly linkable (test by opening in a new tab)
+- [ ] Try accessing another team's component URL directly — 403
 - [ ] Deploy to Katana dev — IAM writes succeed without cert env vars
 
 ---
 
 ## Revision Notes
+
+**v7 changes (Elasticsearch docs + raw logs + shopper breakdown):**
+
+- **Elasticsearch Data Sources section** — Added to the plan between the Switchboard data model and Access Control Model. Documents both clusters (logs + RUM) with key fields, which queries use each, and example documents.
+- **`pages/docs/elasticsearch.js`** — New static docs page explaining the two clusters; linked from the Logs sub-page "Data sources" link. Added to Task 12 and file structure.
+- **Raw log table** — `queryRawLogs` added to `clients/elasticsearch.js`; `GET /api/analytics/logs` added to `routes/analytics.js`; Logs sub-page renders last 100 entries with timestamp, level badge, message, app, page URL, shopper ID, and collapsible stack trace.
+- **Errors-by-shopper breakdown** — `queryErrorsByUser` (`terms` agg on `client.user.id`) added to ES client; `GET /api/analytics/errors-by-user` added to analytics routes; Logs sub-page renders top shoppers by error count when present.
+- **Kibana Discover deep-link** — `kibanaDiscover: { logsUrl, logsDataViewId }` added to all environments in `gasket.js`. `GET /api/config` now exposes it alongside `kibanaDashboards`. `buildKibanaDiscoverUrl` helper builds Rison-encoded URL with pre-filtered KQL query.
+- **Level filter scope expanded** — The log-level filter now applies to both chart data and raw log entries, so all sections (charts, shopper table, raw entries) stay in sync.
 
 **v6 changes:**
 
@@ -5233,29 +5725,56 @@ git commit -m "feat: connect-gd-auth SSO gate"
 
 ## Verification Checklist
 
-- [ ] `npm run local` — dev server starts, no startup errors
-- [ ] `/` — list loads; search box filters case-insensitively while you type; alpha-sorted
-- [ ] As regular user, list shows ONLY components where you're in cds-auth jomax allowlist
-- [ ] After adding your jomax user to `cds-admin.admins.jomax`, reload — full list appears
-- [ ] `/components/new` — create a test component, confirm 3 Switchboard entries (cds, cds-auth, cds-admin)
-- [ ] `/components/{name}` — single dashboard page with all cards visible (no tabs)
-- [ ] Manifest card — invalid JSON disables Save, valid JSON saves
-- [ ] Notes card — plain-text textarea, auto-saves after 1.5s, stored under `registry.{name}.notes`
-- [ ] Recent History card — entries appear; Rollback reverts and updates manifest
-- [ ] Env Sync card — prod→test; allowlist check on DESTINATION env enforced
-- [ ] i18n card — set hash; sub-key history works; rollback reverts
-- [ ] RUM card — set JSON config; JSON validation blocks invalid save
-- [ ] Access card — add/remove jomax users; last-user removal blocked
-- [ ] Alerts card — set webhook, send test message
-- [ ] Analytics card — shows last-24h sparklines; "Full analytics →" navigates to `/analytics?component={name}`
-- [ ] `/analytics` — component dropdown, time ranges, full charts
-- [ ] Try accessing another team's component URL directly — 403
+- [ ] `npm run local` — dev server starts, AWS SSO check passes
 - [ ] `npm test` — all tests pass
+- [ ] `/` — list loads with `lastUpdated` column; search filters case-insensitively; alpha-sorted; env dropdown in top nav changes which env's components are shown
+- [ ] As regular user, list shows ONLY components you're allowlisted on; super-admin sees all
+- [ ] `/components/new` — create a test component; cds-auth entry created; redirect to detail page
+- [ ] `/components/{name}` (main page) — RUM sparklines + error sparklines + notes textarea load; notes auto-save after 1.5s; tab bar renders all 6 tabs
+- [ ] `/components/{name}/manifest` — JSON editor validates live; Save works; History/Rollback work; i18n hash saves; Slack test fires
+- [ ] `/components/{name}/auth` — add/remove jomax users; last-user removal blocked; "How cds-auth works →" links to docs; cert/awsiam show read-only
+- [ ] `/docs/cds-auth` — page renders explaining jomax/cert/awsiam
+- [ ] `/docs/elasticsearch` — page renders explaining logs cluster fields, RUM cluster fields, with example documents for each
+- [ ] `/components/{name}/rum` — Web Vitals charts with deployment marker at `metaData.updatedAt`; RUM config editor saves
+- [ ] `/components/{name}/logs` — level filter (error/warn/info/all) changes charts AND raw log entries; filter persists in localStorage after page reload; deployment marker visible; request volume chart renders; raw log table shows last 100 entries with timestamp, level badge, message, app, shopper ID; stack trace expander works on entries with `error.stack_trace`; errors-by-shopper table appears when there are shoppers; "Open in Kibana Discover →" deep-link opens pre-filtered to the component
+- [ ] `/components/{name}/sync` — Copy prod→test; allowlist checked on DESTINATION env
+- [ ] `/analytics` — component dropdown, time ranges, full charts, Kibana dashboard deep-links
+- [ ] Each sub-page URL is directly linkable (test by opening in a new tab)
+- [ ] Try accessing another team's component URL directly — 403
 - [ ] Deploy to Katana dev — IAM writes succeed without cert env vars
 
 ---
 
 ## Revision Notes
+
+**v7 changes (Elasticsearch docs + raw logs + shopper breakdown):**
+
+- **Elasticsearch Data Sources section** — Added to the plan between the Switchboard data model and Access Control Model. Documents both clusters (logs + RUM) with key fields, which queries use each, and example documents. Engineers implementing the ES client now have a concrete reference for field names without having to grep live indices.
+- **`pages/docs/elasticsearch.js`** — New static docs page explaining the two clusters; linked from the Logs sub-page. Added to file structure.
+- **Raw log table** — `queryRawLogs` added to `clients/elasticsearch.js`; `GET /api/analytics/logs` added to `routes/analytics.js`; Logs sub-page renders last 100 entries with timestamp, level badge, message, app, page URL, shopper ID, and collapsible stack trace.
+- **Errors-by-shopper breakdown** — `queryErrorsByUser` (`terms` agg on `client.user.id`) added to ES client; `GET /api/analytics/errors-by-user` added to analytics routes; Logs sub-page renders top shoppers by error count.
+- **Kibana Discover deep-link** — `kibanaDiscover: { logsUrl, logsDataViewId }` added to all environments in `gasket.js`. `GET /api/config` now exposes it alongside `kibanaDashboards`. `buildKibanaDiscoverUrl` helper builds Rison-encoded URL with pre-filtered KQL query.
+- **Level filter scope expanded** — The log-level filter now applies to both the chart data and the raw log entries, so all three sections (charts, shopper table, raw entries) stay in sync.
+- **Verification checklist** — Updated from old single-page language to match current tabbed architecture; added specific checks for raw log table, shopper breakdown, Kibana Discover link, and docs pages.
+
+**v6 changes (tabbed multi-page architecture):**
+
+- **Global env selector in Layout** — The env dropdown (dev/test/prod) lives in the `Layout` nav and applies to all pages: component list, all 6 component detail sub-pages, and analytics. `ComponentNav` only receives `name` and `env` for building correct tab URLs; it no longer owns the selector.
+
+**v5 changes:**
+
+- **Per-env Kibana dashboard URLs** — Removed `NEXT_PUBLIC_KIBANA_*` env vars. Kibana base URLs now live in `gasket.js` `environments` block as `kibanaDashboards: { logs, rum }`. Exposed to the client via `GET /api/config`.
+- **Dynamic SSO redirect path** — `ssoRedirect` now built per-request: `${auth.ssoBase}/?realm=jomax&app=cds-admin&path=${encodeURIComponent(req.originalUrl)}`.
+- **ES API keys: local file vs. Katana secrets** — `.env.local.example` updated with explicit comments.
+
+**v4 changes (tabbed sub-pages):**
+
+- **Tabbed sub-pages** — Component detail is now 6 deep-linkable pages: main, manifest, auth, rum, logs, sync.
+- **`lastUpdated` on list page** — `GET /api/components` returns `[{ name, lastUpdated }]`.
+- **Log level filter** — Logs sub-page has error/warn/info/all filter; persisted in localStorage as `cds-admin:logLevel:{name}`.
+- **Deployment markers** — RUM and Logs sub-pages fetch `metaData.updatedAt` and render a `ReferenceLine`.
+- **cds-auth docs page** — `/docs/cds-auth` explains jomax/cert/awsiam auth types.
+- **`queryErrors` level param** — accepts `level` as 4th arg; `'all'` omits the log.level term filter.
 
 **v3 changes (single-page dashboard + access control):**
 
