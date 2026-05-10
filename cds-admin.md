@@ -18,12 +18,14 @@ cds-admin/
 ├── package.json                     # type:module, next/node scripts
 ├── next.config.js
 ├── .env.local.example
+├── scripts/
+│   └── check-aws-sso.js             # Pre-startup AWS SSO check; reads awsProfile from gasket.js
 ├── clients/
-│   ├── switchboard.js               # ConfigClient factory — one instance per (app,env)
+│   ├── switchboard.js               # ConfigClient factory — one instance per (app,env); auth via AWS SDK credential chain
 │   ├── elasticsearch.js             # ES client wrappers — getLogsClient() for errors/volume, getRumClient() for web vitals
 │   └── slack.js                     # Slack incoming webhook sender
 ├── plugins/
-│   └── switchboard-auth.js          # Injects cert/IAM into ConfigClient at prepare
+│   └── switchboard-auth.js          # Sets AWS_PROFILE from gasket.config.awsProfile at prepare
 ├── middleware/
 │   └── require-jomax.js             # Reads req.gdAuth.jwt.jomax; 401 if missing
 ├── lib/
@@ -33,7 +35,7 @@ cds-admin/
 │   ├── components.js                # registry.{name}: list (filtered), get, put, create, history, rollback, sync
 │   ├── i18n.js                      # registry.{name}.i18nVersion: get, put, history, rollback
 │   ├── rum.js                       # registry.{name}.rum: get, put, history, rollback
-│   ├── notes.js                     # registry.{name}.notes: get, put (markdown, no history)
+│   ├── notes.js                     # registry.{name}.notes: get, put (plain text, no history)
 │   ├── access.js                    # cds-auth {name}: get, put jomax array
 │   ├── alerts.js                    # cds-admin config.{name}: get, put, test
 │   └── analytics.js                 # ES proxy: errors, volume, rum vitals
@@ -47,7 +49,7 @@ cds-admin/
 ├── components/
 │   ├── Layout.js                    # Shell: nav, env selector, user display
 │   ├── JsonEditor.js                # Monaco wrapper; emits onChange + onValidate
-│   ├── MarkdownNotes.js             # Editable markdown with live preview (react-markdown)
+│   ├── Notes.js                     # Plain-text notes textarea with debounced auto-save
 │   ├── HistoryTimeline.js           # List of history entries + Rollback button
 │   ├── SyncPanel.js                 # Env status badges + Copy env→env buttons
 │   ├── AccessList.js                # jomax list: add/remove usernames (last-user protected)
@@ -84,7 +86,7 @@ cds-admin/
 | `registry.{name}` | JSON | Manifest: dependencies, engine, js, metaData |
 | `registry.{name}.i18nVersion` | string | i18n hash (e.g. `607a011`) |
 | `registry.{name}.rum` | JSON | RUM poller config |
-| `registry.{name}.notes` | string (markdown) | Engineer notes, free-form |
+| `registry.{name}.notes` | string | Engineer notes, plain text, free-form |
 
 ### `cds-auth` app — per-component allowlist
 | Key | Value |
@@ -127,7 +129,7 @@ cd cds-admin
 
 ```bash
 npm install @wsb/config-api-client @wsb/core-config-rules connect-gd-auth \
-  @elastic/elasticsearch @monaco-editor/react recharts react-markdown \
+  @elastic/elasticsearch @monaco-editor/react recharts \
   @ux/button @ux/text @ux/text-entry @ux/spinner @ux/tag
 
 npm install --save-dev jest @jest/globals supertest jest-environment-node \
@@ -150,18 +152,22 @@ export default makeGasket({
   environments: {
     local: {
       hostname: 'localhost',
+      awsProfile: 'cds-admin-dev-sso',
       auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
     },
     dev: {
       hostname: 'cds-admin.int.dev-gdcorp.tools',
+      awsProfile: 'cds-admin-dev-sso',
       auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
     },
     test: {
       hostname: 'cds-admin.int.test-gdcorp.tools',
+      awsProfile: 'cds-admin-test-sso',
       auth: { host: 'sso.test-godaddy.com', ssoRedirect: 'https://sso.test-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
     },
     prod: {
       hostname: 'cds-admin.int.gdcorp.tools',
+      awsProfile: null,  // Katana injects IAM role directly — no profile needed
       auth: { host: 'sso.godaddy.com', ssoRedirect: 'https://sso.gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
     }
   }
@@ -177,7 +183,7 @@ export default makeGasket({
     "dev":   "next dev",
     "build": "next build",
     "start": "node server.js",
-    "local": "GASKET_ENV=local next dev",
+    "local": "GASKET_ENV=local node scripts/check-aws-sso.js && GASKET_ENV=local next dev",
     "test":  "node --experimental-vm-modules node_modules/.bin/jest"
   }
 }
@@ -201,21 +207,57 @@ ELASTICSEARCH_RUM_API_KEY=
 NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL=https://<logs-kibana>/app/dashboards#/view/<dashboard-id>
 NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL=https://<rum-kibana>/app/dashboards#/view/<dashboard-id>
 
-# Local dev auth — use ONE of:
-SWITCHBOARD_CERT_PATH=/path/to/your.crt
-SWITCHBOARD_CERT_KEY_PATH=/path/to/your.key
-# OR
-SWITCHBOARD_JWT=<token from ssojwt CLI>
-
-# Production (injected by Katana)
-# SWITCHBOARD_IAM_CERT_PATH=
-# SWITCHBOARD_IAM_KEY_PATH=
-
 SESSION_SECRET=dev-secret-change-in-prod
 # SSO host is configured per-environment in gasket.js environments block — no env var needed
+# AWS profile is configured per-environment in gasket.js (awsProfile field)
+# Run `aws sso login --profile cds-admin-dev-sso` before starting locally
 ```
 
-- [ ] **Step 6: Create jest.config.js** (required for ESM tests)
+- [ ] **Step 6: Create scripts/check-aws-sso.js**
+
+Runs before the dev server. Imports `gasketConfig` to get the `awsProfile` for the current `GASKET_ENV`, then verifies the session is active via `aws sts get-caller-identity`. If not, exits with a clear, actionable error.
+
+```js
+// scripts/check-aws-sso.js
+import { execFileSync } from 'child_process';
+import { gasketConfig } from '../gasket.js';
+
+const env = process.env.GASKET_ENV || 'local';
+const profile = gasketConfig.environments?.[env]?.awsProfile;
+
+if (!profile) {
+  // Katana/CI injects credentials directly — no profile needed
+  process.exit(0);
+}
+
+try {
+  execFileSync('aws', ['sts', 'get-caller-identity', '--profile', profile], {
+    stdio: 'pipe',
+    encoding: 'utf-8',
+    timeout: 5000
+  });
+} catch (err) {
+  const notFound = err.code === 'ENOENT';
+  if (notFound) {
+    console.error('❌ ERROR: AWS CLI not found. Install it: https://aws.amazon.com/cli/');
+  } else {
+    console.error(`
+❌ ERROR: AWS SSO session is not active or expired!
+
+This will cause Switchboard authentication to fail with:
+   "Token Management Error: Unable to obtain token from SSO"
+
+To fix this, run:
+   aws sso login --profile ${profile}
+
+Then restart the dev server.
+`);
+  }
+  process.exit(1);
+}
+```
+
+- [ ] **Step 7: Create jest.config.js** (required for ESM tests)
 
 ```js
 // jest.config.js
@@ -227,17 +269,18 @@ export default {
 };
 ```
 
-- [ ] **Step 7: Verify dev server starts**
+- [ ] **Step 8: Verify dev server starts**
 
 ```bash
 cp .env.local.example .env.local
-# fill in your certs/jwt
+# fill in ES keys, then:
+aws sso login --profile cds-admin-dev-sso
 npm run local
 ```
 
-Expected: Next.js compiles, server starts on port 3000.
+Expected: AWS SSO check passes, Next.js compiles, server starts on port 3000.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git init && git add .
@@ -257,9 +300,10 @@ git commit -m "feat: initial Gasket 7 scaffold"
 
 ```js
 // test/clients/switchboard.test.js
+// Auth is handled entirely by the AWS SDK credential chain (AWS_PROFILE set by
+// switchboard-auth.js plugin). The client itself needs no auth options.
 import { jest } from '@jest/globals';
 
-// ESM: use jest.unstable_mockModule + dynamic imports AFTER the mock.
 const ConfigClientMock = jest.fn().mockImplementation(() => ({
   get: jest.fn(),
   put: jest.fn(),
@@ -269,15 +313,18 @@ const ConfigClientMock = jest.fn().mockImplementation(() => ({
 jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
 jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
 
-process.env.SWITCHBOARD_CERT_PATH = '/fake/cert.crt';
-process.env.SWITCHBOARD_CERT_KEY_PATH = '/fake/cert.key';
-
 const { getCdsClient, getCdsAuthClient, getCdsAdminClient } = await import('../../clients/switchboard.js');
 
 test('getCdsClient returns same instance for same env', () => {
   const a = getCdsClient('dev');
   const b = getCdsClient('dev');
   expect(a).toBe(b);
+});
+
+test('getCdsClient and getCdsAuthClient return different instances', () => {
+  const cds = getCdsClient('dev');
+  const auth = getCdsAuthClient('dev');
+  expect(cds).not.toBe(auth);
 });
 
 test('getCdsAuthClient uses cds-auth app', () => {
@@ -290,29 +337,9 @@ test('getCdsAdminClient uses cds-admin app', () => {
   expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({ app: 'cds-admin' }));
 });
 
-test('throws at first getClient call when no auth env vars set', async () => {
-  delete process.env.SWITCHBOARD_CERT_PATH;
-  delete process.env.SWITCHBOARD_CERT_KEY_PATH;
-  delete process.env.SWITCHBOARD_IAM_CERT_PATH;
-  delete process.env.SWITCHBOARD_JWT;
-  jest.resetModules();
-  jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
-  jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
-  const mod = await import('../../clients/switchboard.js');
-  expect(() => mod.getCdsClient('dev')).toThrow('No Switchboard auth');
-});
-
-test('uses JWT via fetchOptions header when SWITCHBOARD_JWT set', async () => {
-  delete process.env.SWITCHBOARD_CERT_PATH;
-  process.env.SWITCHBOARD_JWT = 'jwt-token-xyz';
-  jest.resetModules();
-  jest.unstable_mockModule('@wsb/config-api-client', () => ({ default: ConfigClientMock }));
-  jest.unstable_mockModule('@wsb/core-config-rules', () => ({ default: {} }));
-  const mod = await import('../../clients/switchboard.js');
-  mod.getCdsClient('dev');
-  expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({
-    fetchOptions: { headers: { Authorization: 'sso-jwt jwt-token-xyz' } }
-  }));
+test('local env maps to dev switchboard env', () => {
+  getCdsClient('local');
+  expect(ConfigClientMock).toHaveBeenCalledWith(expect.objectContaining({ env: 'dev' }));
 });
 ```
 
@@ -328,36 +355,13 @@ Expected: `Cannot find module '../../clients/switchboard.js'`
 
 ```js
 // clients/switchboard.js
+// Auth is entirely handled by the AWS SDK credential chain. AWS_PROFILE is set
+// at startup by plugins/switchboard-auth.js from gasket.config.awsProfile.
+// No auth options needed here — ConfigClient picks up credentials automatically.
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const ConfigClient = require('@wsb/config-api-client');
 const configRules = require('@wsb/core-config-rules');
-
-// Build auth config from env. Called lazily on first getClient() so the module
-// can be imported in contexts (SSR, tests) without auth vars set.
-function buildClientOptions() {
-  // IAM cert (Katana prod)
-  if (process.env.SWITCHBOARD_IAM_CERT_PATH) {
-    return { auth: {
-      cert: [process.env.SWITCHBOARD_IAM_CERT_PATH],
-      key: process.env.SWITCHBOARD_IAM_KEY_PATH
-    }};
-  }
-  // Client cert (local dev Option A)
-  if (process.env.SWITCHBOARD_CERT_PATH) {
-    return { auth: {
-      cert: [process.env.SWITCHBOARD_CERT_PATH],
-      key: process.env.SWITCHBOARD_CERT_KEY_PATH
-    }};
-  }
-  // ssojwt bearer token (local dev Option B)
-  if (process.env.SWITCHBOARD_JWT) {
-    return { fetchOptions: {
-      headers: { Authorization: `sso-jwt ${process.env.SWITCHBOARD_JWT}` }
-    }};
-  }
-  throw new Error('No Switchboard auth configured. Set SWITCHBOARD_IAM_CERT_PATH, SWITCHBOARD_CERT_PATH, or SWITCHBOARD_JWT.');
-}
 
 const cache = {};
 
@@ -368,8 +372,7 @@ function getClient(app, env) {
       app,
       env: env === 'local' ? 'dev' : env,
       plugins: [configRules],
-      cache: { path: null, tts: 30000 },
-      ...buildClientOptions()
+      cache: { path: null, tts: 30000 }
     });
   }
   return cache[key];
@@ -379,8 +382,6 @@ export const getCdsClient      = env => getClient('cds', env);
 export const getCdsAuthClient  = env => getClient('cds-auth', env);
 export const getCdsAdminClient = env => getClient('cds-admin', env);
 ```
-
-> **Note:** the `fetchOptions.headers.Authorization` approach for SWITCHBOARD_JWT assumes the underlying `@wsb/config-api-client` accepts a pre-built JWT via a Bearer-style header. If in practice it only accepts cert/key or IAM, this branch should be adjusted — the closest alternative is to use ssojwt's cert output as `SWITCHBOARD_CERT_PATH`.
 
 - [ ] **Step 4: Run test — expect PASS**
 
@@ -392,13 +393,17 @@ npm test -- test/clients/switchboard.test.js
 
 ```js
 // plugins/switchboard-auth.js
+// Sets AWS_PROFILE from gasket.config.awsProfile so the AWS SDK credential chain
+// picks up the right SSO profile for the current environment.
+// In prod, Katana injects IAM role credentials directly — awsProfile is null there.
 export default {
   name: 'cds-admin-switchboard-auth',
   hooks: {
     prepare(gasket) {
-      // Validate auth env vars at startup so the app fails fast locally
-      if (!process.env.SWITCHBOARD_IAM_CERT_PATH && !process.env.SWITCHBOARD_CERT_PATH) {
-        gasket.logger.warn('No Switchboard cert configured. API routes will fail.');
+      const profile = gasket.config.awsProfile;
+      if (profile) {
+        process.env.AWS_PROFILE = profile;
+        gasket.logger.info(`[switchboard-auth] AWS_PROFILE set to ${profile}`);
       }
     }
   }
@@ -409,7 +414,7 @@ export default {
 
 ```bash
 git add clients/switchboard.js plugins/switchboard-auth.js test/clients/switchboard.test.js
-git commit -m "feat: switchboard client factory with cert/IAM auth"
+git commit -m "feat: switchboard client factory with IAM role auth"
 ```
 
 ---
@@ -2288,12 +2293,12 @@ git commit -m "feat: slack webhook alerts config"
 
 ---
 
-## Task 13: Notes (markdown, no history)
+## Task 13: Notes (plain text, no history)
 
 **Files:**
 - Create: `routes/notes.js`
 - Create: `test/routes/notes.test.js`
-- Create: `components/MarkdownNotes.js`
+- Create: `components/Notes.js`
 - Modify: `pages/components/[name].js` (fill in Notes card)
 
 - [ ] **Step 1: Write failing tests**
@@ -2406,17 +2411,15 @@ export default router;
 
 - [ ] **Step 4: Run tests — expect PASS**
 
-- [ ] **Step 5: Create components/MarkdownNotes.js**
+- [ ] **Step 5: Create components/Notes.js**
 
 ```jsx
-// components/MarkdownNotes.js
-// Editable markdown with a preview/split toggle. Debounces saves while typing.
+// components/Notes.js
+// Plain-text notes with debounced auto-save (1.5s after typing stops).
 import { useState, useEffect, useRef } from 'react';
-import ReactMarkdown from 'react-markdown';
 
-export default function MarkdownNotes({ componentName, env }) {
+export default function Notes({ componentName, env }) {
   const [value, setValue] = useState('');
-  const [mode, setMode] = useState('split');  // 'edit' | 'preview' | 'split'
   const [status, setStatus] = useState('');
   const [loaded, setLoaded] = useState(false);
   const saveTimer = useRef(null);
@@ -2427,7 +2430,6 @@ export default function MarkdownNotes({ componentName, env }) {
       .then(data => { setValue(data.value ?? ''); setLoaded(true); });
   }, [componentName, env]);
 
-  // Debounced auto-save (1.5s after typing stops)
   useEffect(() => {
     if (!loaded) return;
     clearTimeout(saveTimer.current);
@@ -2449,33 +2451,15 @@ export default function MarkdownNotes({ componentName, env }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: 4, marginBottom: 8, fontSize: 12 }}>
-        {['edit', 'split', 'preview'].map(m => (
-          <button
-            key={m}
-            onClick={() => setMode(m)}
-            style={{ padding: '2px 8px', fontWeight: mode === m ? 'bold' : 'normal' }}
-          >
-            {m}
-          </button>
-        ))}
-        <span style={{ marginLeft: 'auto', color: '#666' }}>{status}</span>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: 12, color: '#666', marginBottom: 4 }}>
+        {status}
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: mode === 'split' ? '1fr 1fr' : '1fr', gap: 12 }}>
-        {(mode === 'edit' || mode === 'split') && (
-          <textarea
-            value={value}
-            onChange={e => setValue(e.target.value)}
-            placeholder="# Add notes in markdown…"
-            style={{ width: '100%', minHeight: 180, fontFamily: 'monospace', fontSize: 13, padding: 8, border: '1px solid #ccc', borderRadius: 4 }}
-          />
-        )}
-        {(mode === 'preview' || mode === 'split') && (
-          <div style={{ border: '1px solid #eee', borderRadius: 4, padding: 12, minHeight: 180, background: '#fafafa' }}>
-            {value ? <ReactMarkdown>{value}</ReactMarkdown> : <p style={{ color: '#999', margin: 0 }}>No notes yet.</p>}
-          </div>
-        )}
-      </div>
+      <textarea
+        value={value}
+        onChange={e => setValue(e.target.value)}
+        placeholder="Add notes…"
+        style={{ width: '100%', minHeight: 180, fontFamily: 'monospace', fontSize: 13, padding: 8, border: '1px solid #ccc', borderRadius: 4, resize: 'vertical' }}
+      />
     </div>
   );
 }
@@ -2486,18 +2470,18 @@ export default function MarkdownNotes({ componentName, env }) {
 In `pages/components/[name].js`:
 
 ```jsx
-import MarkdownNotes from '../../components/MarkdownNotes.js';
+import Notes from '../../components/Notes.js';
 // ...
 <Card title="Notes">
-  {name && <MarkdownNotes componentName={name} env={env} />}
+  {name && <Notes componentName={name} env={env} />}
 </Card>
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add routes/notes.js test/routes/notes.test.js components/MarkdownNotes.js pages/components/[name].js
-git commit -m "feat: markdown notes per component (auto-save, live preview)"
+git add routes/notes.js test/routes/notes.test.js components/Notes.js pages/components/[name].js
+git commit -m "feat: plain-text notes per component (auto-save)"
 ```
 
 ---
@@ -3158,7 +3142,7 @@ git commit -m "feat: connect-gd-auth SSO gate"
 - [ ] `/components/new` — create a test component, confirm 3 Switchboard entries (cds, cds-auth, cds-admin)
 - [ ] `/components/{name}` — single dashboard page with all cards visible (no tabs)
 - [ ] Manifest card — invalid JSON disables Save, valid JSON saves
-- [ ] Notes card — markdown with edit/split/preview, auto-saves after 1.5s, stored under `registry.{name}.notes`
+- [ ] Notes card — plain-text textarea, auto-saves after 1.5s, stored under `registry.{name}.notes`
 - [ ] Recent History card — entries appear; Rollback reverts and updates manifest
 - [ ] Env Sync card — prod→test; allowlist check on DESTINATION env enforced
 - [ ] i18n card — set hash; sub-key history works; rollback reverts
@@ -3178,7 +3162,7 @@ git commit -m "feat: connect-gd-auth SSO gate"
 **v3 changes (single-page dashboard + access control):**
 
 - **Single-page dashboard** — component detail page is now a grid of `Card` sections (Overview, Notes, Manifest, Access, Alerts, i18n, RUM, Sync, Recent History, Analytics) instead of tabs. Everything about a component is visible on one page.
-- **Notes feature** — new `registry.{name}.notes` Switchboard key (markdown string, no history). New `routes/notes.js`, `components/MarkdownNotes.js` with edit/split/preview modes and debounced auto-save. Task 13.
+- **Notes feature** — new `registry.{name}.notes` Switchboard key (plain text string, no history). New `routes/notes.js`, `components/Notes.js` with debounced auto-save. Task 13.
 - **Super-admin bypass** — new `cds-admin.admins` Switchboard key (`{ jomax: [...] }`) lists users who bypass all per-component access checks. Not editable via the app.
 - **Read access gating** — previously, any Jomax user could read any component. Now reads also require allowlist membership (or super-admin). New `lib/access-control.js` exposes `isSuperAdmin`, `canAccess`, `assertCanAccess`, `listAccessibleComponents`. All detail GETs call `assertCanAccess`.
 - **Component list filtering** — `GET /api/components` filters to components the user is allowlisted on (super admins see all).
