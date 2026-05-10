@@ -1479,15 +1479,14 @@ git commit -m "feat: manifest history/rollback API + HistoryTimeline component"
 
 The main page shows RUM sparklines + error sparklines + a notes textarea. It fetches the manifest only to read `metaData.updatedAt` for the overview header — the full editor lives on the Manifest sub-page. Sparklines come from the analytics API. The notes textarea auto-saves.
 
-`ComponentNav` is the tab bar reused on every sub-page. It reads the current path to highlight the active tab. It includes an inline env dropdown so users can switch between dev/test/prod data without leaving the component detail page — important because the app may be deployed to a specific env but users need to view or compare data across all three.
+`ComponentNav` is the tab bar reused on every sub-page. It reads the current path to highlight the active tab. Tab links include the current `env` query param so switching tabs preserves the selected environment.
 
 - [ ] **Step 1: Create components/ComponentNav.js**
 
 ```jsx
 // components/ComponentNav.js
 // Shared tab bar for all /components/[name]/* pages.
-// Includes inline env selector so users can view dev/test/prod data regardless
-// of which environment the app is deployed to.
+// Tab links carry the current env query param so switching tabs preserves the environment.
 import { useRouter } from 'next/router';
 
 const TABS = [
@@ -1499,7 +1498,7 @@ const TABS = [
   { label: 'Sync',      href: '/sync' },
 ];
 
-export default function ComponentNav({ name, env, onEnvChange }) {
+export default function ComponentNav({ name, env }) {
   const router = useRouter();
   const base = `/components/${name}`;
 
@@ -1527,17 +1526,6 @@ export default function ComponentNav({ name, env, onEnvChange }) {
           </a>
         );
       })}
-      {onEnvChange && (
-        <select
-          value={env}
-          onChange={e => onEnvChange(e.target.value)}
-          style={{ marginLeft: 'auto', padding: '4px 8px', fontSize: 13, borderRadius: 4, border: '1px solid #ccc' }}
-        >
-          <option value="dev">dev</option>
-          <option value="test">test</option>
-          <option value="prod">prod</option>
-        </select>
-      )}
     </nav>
   );
 }
@@ -1580,7 +1568,7 @@ export default function ComponentMain() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', margin: '8px 0 16px' }}>
@@ -1595,7 +1583,7 @@ export default function ComponentMain() {
           <a href={`/analytics?component=${name}`} style={{ fontSize: 13, color: '#0070d2' }}>Full analytics →</a>
         </div>
 
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 32 }}>
           <MiniChart data={errors.buckets} dataKey="count" color="#e53e3e"
@@ -2082,11 +2070,11 @@ export default function ManifestPage() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
 
         <section style={sectionStyle}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
@@ -2385,11 +2373,11 @@ export default function AuthPage() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
           <h2 style={{ margin: 0 }}>Access Control</h2>
@@ -2609,11 +2597,11 @@ export default function SyncPage() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
         <h2>Environment Sync</h2>
         <p style={{ color: '#555', fontSize: 13, marginBottom: 24 }}>
           Copy the manifest from one environment to another. You must be allowlisted on the destination environment.
@@ -3307,11 +3295,11 @@ export default function RumPage() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -3439,11 +3427,11 @@ export default function LogsPage() {
   }
 
   return (
-    <Layout>
+    <Layout env={env} onEnvChange={handleEnvChange}>
       <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
         <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
         <h1 style={{ margin: '8px 0 16px' }}>{name}</h1>
-        {name && <ComponentNav name={name} env={env} onEnvChange={handleEnvChange} />}
+        {name && <ComponentNav name={name} env={env} />}
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -3582,10 +3570,10 @@ git commit -m "feat: connect-gd-auth SSO gate"
 
 - [ ] `npm run local` — dev server starts, AWS SSO check passes
 - [ ] `npm test` — all tests pass
-- [ ] `/` — list loads with `lastUpdated` column; search filters case-insensitively; alpha-sorted
+- [ ] `/` — list loads with `lastUpdated` column; search filters case-insensitively; alpha-sorted; env dropdown in top nav changes which env's components are shown
 - [ ] As regular user, list shows ONLY components you're allowlisted on; super-admin sees all
 - [ ] `/components/new` — create a test component; cds-auth entry has `{ jomax: [''], cert: [''], awsiam: [''] }` (not creator's username)
-- [ ] `/components/{name}` (main page) — sparklines load; notes textarea auto-saves; tab bar renders with all 6 tabs and env dropdown (dev/test/prod)
+- [ ] `/components/{name}` (main page) — sparklines load; notes textarea auto-saves; tab bar renders with all 6 tabs; env dropdown is in the top nav (not the tab bar)
 - [ ] `/components/{name}/manifest` — JSON editor validates live; Save works; History/Rollback work; i18n hash saves; Slack test fires
 - [ ] `/components/{name}/auth` — add/remove jomax users; last-user removal blocked; "How cds-auth works →" links to docs; cert/awsiam show read-only
 - [ ] `/docs/cds-auth` — page renders explaining jomax/cert/awsiam
@@ -3602,7 +3590,7 @@ git commit -m "feat: connect-gd-auth SSO gate"
 
 **v6 changes:**
 
-- **Inline env dropdown in ComponentNav** — `ComponentNav` now accepts an `onEnvChange` prop and renders a right-aligned `<select>` (dev/test/prod) directly in the tab bar. This makes it visually obvious which environment's data is being viewed, and lets users switch envs without leaving the component detail page — critical when the app itself is deployed to a specific env (e.g. test) but the user needs to compare prod data. All 6 component detail pages (`index.js`, `manifest.js`, `auth.js`, `rum.js`, `logs.js`, `sync.js`) pass `onEnvChange` to `ComponentNav` and drop the `env`/`onEnvChange` props from `<Layout>` since the env selector has moved.
+- **Global env selector in Layout** — The env dropdown (dev/test/prod) lives in the `Layout` nav and applies to all pages: component list, all 6 component detail sub-pages, and analytics. The list page already used `<Layout env={env} onEnvChange={setEnv}>` — all component detail pages now do the same. `ComponentNav` only receives `name` and `env` (for building correct tab URLs); it no longer owns the selector. This makes the selected environment globally visible and consistent, and correctly scopes the component list to the chosen env.
 
 **v5 changes:**
 
