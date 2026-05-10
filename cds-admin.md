@@ -1,12 +1,51 @@
-# CDS Admin Tool Implementation Plan
+# CDS Admin Tool
+
+## Overview
+
+CDS (Component Delivery Service) is GoDaddy's microfrontend platform. Teams publish ESM components to a CDN; consuming apps load them at runtime via `cds-loader`. Today, all lifecycle operations — deploying, configuring, managing access — happen through CLI tools or direct Switchboard edits. There is no UI.
+
+This tool is a web app for CDS component owners. It lives at `cds-admin.int.{env}-gdcorp.tools`, is secured by Jomax SSO, and gives engineers a single place to manage everything about a component.
+
+## What it does
+
+**Component dashboard** — Every component gets one page showing all its data at once (no tabs). From here an engineer can:
+- View and edit the JSON manifest (Monaco editor with live JSON validation)
+- Edit the i18n version hash and RUM poller config (each with full change history and rollback)
+- Write plain-text notes that auto-save as they type
+- View the full Switchboard change history and roll back to any previous version
+- Copy the manifest across environments (dev → test → prod) with a single click
+- Manage the Jomax allowlist for the component (add/remove teammates; last-user removal is blocked)
+- Configure a Slack webhook for deployment alerts and send a test message
+
+**Component list** — Alphabetically sorted, case-insensitive search. Each user only sees components they have access to. Super-admins (managed via a Switchboard key, not the app) see everything.
+
+**Analytics** — Pulls live data from two Elasticsearch clusters and renders it with Recharts:
+- *Logs cluster*: error rate over time, request volume
+- *RUM cluster*: Web Vitals p75 (LCP, CLS, INP)
+- Time range picker (1h / 6h / 24h / 7d)
+- "Open in Kibana →" deep-links that pre-filter the dashboard to the selected component
+
+## Access control
+
+- All pages require a valid Jomax SSO session (`connect-gd-auth`)
+- Component reads and writes both require the user to be on that component's `cds-auth` allowlist
+- Super-admins are listed in `cds-admin.admins.jomax` (edited directly in Switchboard) and bypass all per-component checks
+
+## Auth & infrastructure
+
+- **Switchboard writes**: AWS IAM role via SSO. AWS profile is configured per environment in `gasket.js` (`awsProfile`); a pre-startup script checks the session is active and gives a `aws sso login` hint if not. In prod, Katana injects the IAM role directly.
+- **Elasticsearch**: Two separate clusters (logs + RUM), each with its own URL and API key. Keys stay server-side; the UI only hits `/api/analytics/*` proxy routes.
+- **Deployment**: Katana (GoDaddy's internal deploy platform) to `dev`, `test`, and `prod` internal domains.
+
+---
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a Gasket 7 / Next.js admin UI for GoDaddy's Component Delivery Service that lets engineers view and edit Switchboard manifests, manage access, roll back deployments, sync environments, and monitor component health via Elasticsearch.
 
-**Architecture:** Gasket 7 app (ESM, Pages Router) with Express API routes backed by `@wsb/config-api-client` for Switchboard and `@elastic/elasticsearch` for analytics. All routes protected by `connect-gd-auth` Jomax SSO middleware. UI uses `@ux/*` GoDaddy component library + Monaco Editor for JSON editing + Recharts for analytics charts.
+**Architecture:** Gasket 7 app (ESM, Pages Router) with Express API routes backed by `@wsb/config-api-client` for Switchboard and `@elastic/elasticsearch` for analytics. All routes protected by `connect-gd-auth` Jomax SSO middleware. UI uses Monaco Editor for JSON editing + Recharts for analytics charts.
 
-**Tech Stack:** Gasket 7, Next.js (Pages Router), Express, `@wsb/config-api-client`, `connect-gd-auth`, `@elastic/elasticsearch`, `@monaco-editor/react`, Recharts, `@ux/*`, Jest + Supertest
+**Tech Stack:** Gasket 7, Next.js (Pages Router), Express, `@wsb/config-api-client`, `connect-gd-auth`, `@elastic/elasticsearch`, `@monaco-editor/react`, Recharts, Jest + Supertest
 
 ---
 
