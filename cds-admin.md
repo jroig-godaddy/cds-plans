@@ -27,32 +27,35 @@ cds-admin/
 ├── middleware/
 │   └── require-jomax.js             # Reads req.gdAuth.jwt.jomax; 401 if missing
 ├── lib/
-│   └── allowlist.js                 # Check/assert jomax user is in cds-auth allowlist
+│   └── access-control.js            # isSuperAdmin, canAccess, assertCanAccess (reads + writes)
 ├── routes/
 │   ├── auth.js                      # GET /auth/me, POST /auth/logout
-│   ├── components.js                # registry.{name}: list, get, put, create, history, rollback, sync
+│   ├── components.js                # registry.{name}: list (filtered), get, put, create, history, rollback, sync
 │   ├── i18n.js                      # registry.{name}.i18nVersion: get, put, history, rollback
 │   ├── rum.js                       # registry.{name}.rum: get, put, history, rollback
+│   ├── notes.js                     # registry.{name}.notes: get, put (markdown, no history)
 │   ├── access.js                    # cds-auth {name}: get, put jomax array
 │   ├── alerts.js                    # cds-admin config.{name}: get, put, test
 │   └── analytics.js                 # ES proxy: errors, volume, rum vitals
 ├── pages/
 │   ├── _app.js                      # Auth gate — redirects to SSO if no jomax session
-│   ├── index.js                     # Component list table
+│   ├── index.js                     # Component list (filtered to user's access)
 │   ├── components/
 │   │   ├── new.js                   # Create component form
-│   │   └── [name].js                # Tabbed detail: Manifest/History/Sync/i18n/RUM/Access/Alerts/Analytics
-│   └── analytics.js                 # Standalone full analytics dashboard
+│   │   └── [name].js                # Single-page dashboard — all sections visible at once
+│   └── analytics.js                 # Full analytics page (time ranges, deeper dive)
 ├── components/
 │   ├── Layout.js                    # Shell: nav, env selector, user display
-│   ├── JsonEditor.js                # Monaco wrapper; exposes isValid + value
+│   ├── JsonEditor.js                # Monaco wrapper; emits onChange + onValidate
+│   ├── MarkdownNotes.js             # Editable markdown with live preview (react-markdown)
 │   ├── HistoryTimeline.js           # List of history entries + Rollback button
 │   ├── SyncPanel.js                 # Env status badges + Copy env→env buttons
-│   ├── AccessList.js                # jomax list: add/remove usernames
+│   ├── AccessList.js                # jomax list: add/remove usernames (last-user protected)
 │   └── charts/
 │       ├── ErrorsOverTime.js        # Recharts LineChart for error count
 │       ├── RequestVolume.js         # Recharts LineChart for request count
-│       └── WebVitals.js             # Recharts LineChart for p75 LCP/CLS/INP
+│       ├── WebVitals.js             # Recharts LineChart for p75 LCP/CLS/INP
+│       └── MiniChart.js             # Compact single-metric sparkline for dashboard cards
 └── test/
     ├── clients/
     │   ├── switchboard.test.js
@@ -60,15 +63,48 @@ cds-admin/
     ├── middleware/
     │   └── require-jomax.test.js
     ├── lib/
-    │   └── allowlist.test.js
+    │   └── access-control.test.js
     └── routes/
         ├── components.test.js
         ├── i18n.test.js
         ├── rum.test.js
+        ├── notes.test.js
         ├── access.test.js
         ├── alerts.test.js
         └── analytics.test.js
 ```
+
+---
+
+## Data Model (Switchboard apps)
+
+### `cds` app — one key per piece of data per component
+| Key pattern | Value | Description |
+|-------------|-------|-------------|
+| `registry.{name}` | JSON | Manifest: dependencies, engine, js, metaData |
+| `registry.{name}.i18nVersion` | string | i18n hash (e.g. `607a011`) |
+| `registry.{name}.rum` | JSON | RUM poller config |
+| `registry.{name}.notes` | string (markdown) | Engineer notes, free-form |
+
+### `cds-auth` app — per-component allowlist
+| Key | Value |
+|-----|-------|
+| `{name}` (e.g. `componentA`) | `{ jomax: [...], cert: [...], awsiam: [...] }` |
+
+### `cds-admin` app — admin tool config (new, user provisions)
+| Key | Value | Description |
+|-----|-------|-------------|
+| `config.{name}` | `{ slackWebhookUrl: string \| null }` | Per-component Slack config |
+| `admins` | `{ jomax: ["jroig", "tbogart", ...] }` | **Super-admins** — read/write ANY component. Edited directly in Switchboard (not via the app). |
+
+## Access Control Model
+
+- **Super admins** (`cds-admin.admins.jomax`) bypass all per-component checks — they can read/write anything in any env.
+- **Regular users** see only components where their Jomax username appears in `cds-auth.{name}.jomax` for the current env.
+- Writes always require allowlist membership (or super-admin).
+- Reads now ALSO require allowlist membership (or super-admin) — fixes a prior gap where any Jomax user could read any component.
+
+**Route pattern:** Every route touching a specific component (GET, PUT, POST, DELETE) must call `assertCanAccess(name, req.user.accountName, env)` before the Switchboard operation. The only exception is `GET /api/components` — which uses `listAccessibleComponents()` to filter instead. This pattern must be applied in every route file in Tasks 4, 6, 7, 9, 10, 11, 12, and the new Notes task — not just writes.
 
 ---
 
@@ -91,7 +127,7 @@ cd cds-admin
 
 ```bash
 npm install @wsb/config-api-client @wsb/core-config-rules connect-gd-auth \
-  @elastic/elasticsearch @monaco-editor/react recharts \
+  @elastic/elasticsearch @monaco-editor/react recharts react-markdown \
   @ux/button @ux/text @ux/text-entry @ux/spinner @ux/tag
 
 npm install --save-dev jest @jest/globals supertest jest-environment-node \
@@ -363,11 +399,11 @@ git commit -m "feat: switchboard client factory with cert/IAM auth"
 - Create: `middleware/require-jomax.js`
 - Create: `middleware/require-same-origin.js` (CSRF defense)
 - Create: `middleware/error-handler.js`
-- Create: `lib/allowlist.js`
+- Create: `lib/access-control.js`
 - Create: `routes/auth.js`
 - Create: `test/middleware/require-jomax.test.js`
 - Create: `test/middleware/require-same-origin.test.js`
-- Create: `test/lib/allowlist.test.js`
+- Create: `test/lib/access-control.test.js`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -404,23 +440,68 @@ test('returns 401 when no jomax token', () => {
 ```
 
 ```js
-// test/lib/allowlist.test.js
+// test/lib/access-control.test.js
 import { jest } from '@jest/globals';
 
+const mockCdsAuthGet = jest.fn();
+const mockCdsAdminGet = jest.fn();
+
 jest.unstable_mockModule('../../clients/switchboard.js', () => ({
-  getCdsAuthClient: jest.fn(() => ({
-    get: jest.fn().mockResolvedValue({ jomax: ['jroig', 'alice'] })
-  }))
+  getCdsAuthClient: jest.fn(() => ({ get: mockCdsAuthGet })),
+  getCdsAdminClient: jest.fn(() => ({ get: mockCdsAdminGet }))
 }));
 
-const { assertAllowlisted } = await import('../../lib/allowlist.js');
+const { isSuperAdmin, canAccess, assertCanAccess, listAccessibleComponents } =
+  await import('../../lib/access-control.js');
 
-test('resolves when user is in jomax allowlist', async () => {
-  await expect(assertAllowlisted('componentA', 'jroig', 'dev')).resolves.toBeUndefined();
+beforeEach(() => {
+  mockCdsAuthGet.mockReset();
+  mockCdsAdminGet.mockReset();
 });
 
-test('throws 403 when user is not in allowlist', async () => {
-  await expect(assertAllowlisted('componentA', 'bob', 'dev')).rejects.toMatchObject({ status: 403 });
+test('isSuperAdmin true when user is in cds-admin.admins.jomax', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: ['jroig', 'tbogart'] });
+  expect(await isSuperAdmin('jroig', 'dev')).toBe(true);
+  expect(await isSuperAdmin('bob', 'dev')).toBe(false);
+});
+
+test('canAccess true when user is on allowlist for component', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: [] });
+  mockCdsAuthGet.mockResolvedValue({ jomax: ['alice'] });
+  expect(await canAccess('componentA', 'alice', 'dev')).toBe(true);
+  expect(await canAccess('componentA', 'bob', 'dev')).toBe(false);
+});
+
+test('canAccess true for super admin even when not on component allowlist', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: ['jroig'] });
+  mockCdsAuthGet.mockResolvedValue({ jomax: ['alice'] });
+  expect(await canAccess('componentA', 'jroig', 'dev')).toBe(true);
+});
+
+test('assertCanAccess throws 403 when denied', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: [] });
+  mockCdsAuthGet.mockResolvedValue({ jomax: ['alice'] });
+  await expect(assertCanAccess('componentA', 'bob', 'dev'))
+    .rejects.toMatchObject({ status: 403 });
+});
+
+test('listAccessibleComponents returns ALL for super admin', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: ['jroig'] });
+  // Even if cds-auth has no entries, super admin gets everything
+  expect(await listAccessibleComponents('jroig', 'dev', ['a', 'b', 'c']))
+    .toEqual(['a', 'b', 'c']);
+});
+
+test('listAccessibleComponents filters to user allowlist', async () => {
+  mockCdsAdminGet.mockResolvedValue({ jomax: [] });
+  // One call to cds-auth.get() returns the full map
+  mockCdsAuthGet.mockResolvedValue({
+    a: { jomax: ['alice', 'bob'] },
+    b: { jomax: ['alice'] },
+    c: { jomax: ['charlie'] }
+  });
+  expect(await listAccessibleComponents('alice', 'dev', ['a', 'b', 'c']))
+    .toEqual(['a', 'b']);
 });
 ```
 
@@ -478,21 +559,41 @@ export function requireJomax(req, res, next) {
 }
 ```
 
-- [ ] **Step 4: Implement lib/allowlist.js**
+- [ ] **Step 4: Implement lib/access-control.js**
 
 ```js
-// lib/allowlist.js
-import { getCdsAuthClient } from '../clients/switchboard.js';
+// lib/access-control.js
+import { getCdsAuthClient, getCdsAdminClient } from '../clients/switchboard.js';
 
-export async function assertAllowlisted(componentName, accountName, env) {
-  const client = getCdsAuthClient(env);
-  const entry = await client.get(componentName);
-  const allowed = entry?.jomax ?? [];
-  if (!allowed.includes(accountName)) {
-    const err = new Error(`${accountName} is not in the allowlist for ${componentName}`);
+// Super admins are listed in cds-admin.admins.jomax — they bypass all per-component checks.
+// This key is edited directly in Switchboard (not via the app).
+export async function isSuperAdmin(accountName, env) {
+  const admins = await getCdsAdminClient(env).get('admins');
+  return admins?.jomax?.includes(accountName) ?? false;
+}
+
+// Single-component check — used by detail routes.
+export async function canAccess(componentName, accountName, env) {
+  if (await isSuperAdmin(accountName, env)) return true;
+  const entry = await getCdsAuthClient(env).get(componentName);
+  return entry?.jomax?.includes(accountName) ?? false;
+}
+
+export async function assertCanAccess(componentName, accountName, env) {
+  if (!(await canAccess(componentName, accountName, env))) {
+    const err = new Error(`${accountName} does not have access to ${componentName}`);
     err.status = 403;
     throw err;
   }
+}
+
+// List-filtering variant — returns only components the user can access.
+// For super admins, returns the full list unchanged. For regular users,
+// does ONE cds-auth.get() call to get all entries, then filters in-memory.
+export async function listAccessibleComponents(accountName, env, allComponentNames) {
+  if (await isSuperAdmin(accountName, env)) return allComponentNames;
+  const allAuth = await getCdsAuthClient(env).get() ?? {};
+  return allComponentNames.filter(name => allAuth[name]?.jomax?.includes(accountName));
 }
 ```
 
@@ -600,11 +701,14 @@ import { jest } from '@jest/globals';
 import request from 'supertest';
 import express from 'express';
 
-const mockGet = jest.fn();
+const mockCdsGet = jest.fn();
+const mockCdsAuthGet = jest.fn();
+const mockCdsAdminGet = jest.fn();
+
 jest.unstable_mockModule('../../clients/switchboard.js', () => ({
-  getCdsClient: jest.fn(() => ({ get: mockGet, put: jest.fn() })),
-  getCdsAuthClient: jest.fn(() => ({ put: jest.fn() })),
-  getCdsAdminClient: jest.fn(() => ({ put: jest.fn() }))
+  getCdsClient: jest.fn(() => ({ get: mockCdsGet, put: jest.fn() })),
+  getCdsAuthClient: jest.fn(() => ({ get: mockCdsAuthGet, put: jest.fn() })),
+  getCdsAdminClient: jest.fn(() => ({ get: mockCdsAdminGet, put: jest.fn() }))
 }));
 jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
   requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
@@ -615,13 +719,32 @@ const app = express();
 app.use(express.json());
 app.use(router);
 
-test('GET /api/components returns list of component names', async () => {
-  mockGet.mockResolvedValue({
+test('GET /api/components returns only components the user is allowlisted on', async () => {
+  mockCdsGet.mockResolvedValue({
     'registry.componentA': {},
     'registry.componentB': {},
-    'registry.componentA.rum': {},      // sub-keys excluded
-    'registry.componentA.i18nVersion': {} // sub-keys excluded
+    'registry.componentC': {},
+    'registry.componentA.rum': {},        // sub-keys excluded
+    'registry.componentA.i18nVersion': {}
   });
+  mockCdsAdminGet.mockResolvedValue({ jomax: [] });  // not a super admin
+  mockCdsAuthGet.mockResolvedValue({
+    componentA: { jomax: ['jroig'] },
+    componentB: { jomax: ['alice'] },       // jroig NOT in here
+    componentC: { jomax: ['jroig', 'bob'] }
+  });
+
+  const res = await request(app).get('/api/components');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual(['componentA', 'componentC']);
+});
+
+test('GET /api/components returns ALL components for super admins', async () => {
+  mockCdsGet.mockResolvedValue({
+    'registry.componentA': {},
+    'registry.componentB': {}
+  });
+  mockCdsAdminGet.mockResolvedValue({ jomax: ['jroig'] });  // super admin
 
   const res = await request(app).get('/api/components');
   expect(res.status).toBe(200);
@@ -661,11 +784,11 @@ npm test -- test/routes/components.test.js
 import express from 'express';
 import { getCdsClient, getCdsAuthClient, getCdsAdminClient } from '../clients/switchboard.js';
 import { requireJomax } from '../middleware/require-jomax.js';
-import { assertAllowlisted } from '../lib/allowlist.js';
+import { assertCanAccess, listAccessibleComponents } from '../lib/access-control.js';
 
 const router = express.Router();
 
-// Strip sub-keys (.rum, .i18nVersion) — only top-level registry.* keys
+// Strip sub-keys (.rum, .i18nVersion, .notes) — only top-level registry.* keys
 function extractComponentNames(allKeys) {
   return Object.keys(allKeys)
     .filter(k => k.startsWith('registry.') && k.split('.').length === 2)
@@ -676,7 +799,10 @@ router.get('/api/components', requireJomax, async (req, res, next) => {
   try {
     const env = req.query.env || 'dev';
     const all = await getCdsClient(env).get();
-    res.json(extractComponentNames(all ?? {}));
+    const allNames = extractComponentNames(all ?? {});
+    // Filter to components the caller can access (super admins see all)
+    const accessible = await listAccessibleComponents(req.user.accountName, env, allNames);
+    res.json(accessible);
   } catch (err) { next(err); }
 });
 
@@ -711,13 +837,15 @@ npm test -- test/routes/components.test.js
 
 ```jsx
 // pages/index.js
-import { useState, useEffect } from 'react';
+// Alphabetically sorted, case-insensitive search.
+// "co" matches "componentA", "COmponentB", "iCOn", etc. — anywhere in the name.
+import { useState, useEffect, useMemo } from 'react';
 import Layout from '../components/Layout.js';
 
 export default function ComponentList() {
   const [components, setComponents] = useState([]);
   const [env, setEnv] = useState('dev');
-  const [filter, setFilter] = useState('');
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
     fetch(`/api/components?env=${env}`)
@@ -725,35 +853,67 @@ export default function ComponentList() {
       .then(setComponents);
   }, [env]);
 
-  const filtered = components.filter(c => c.toLowerCase().includes(filter.toLowerCase()));
+  const sorted = useMemo(
+    () => [...components].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
+    [components]
+  );
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return sorted;
+    return sorted.filter(name => name.toLowerCase().includes(q));
+  }, [sorted, query]);
 
   return (
     <Layout env={env} onEnvChange={setEnv}>
-      <div style={{ padding: '24px' }}>
-        <h1>Components</h1>
+      <div style={{ padding: 24, maxWidth: 800, margin: '0 auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h1 style={{ margin: 0 }}>Components</h1>
+          <a
+            href="/components/new"
+            style={{ padding: '8px 16px', background: '#0070d2', color: '#fff', borderRadius: 4, textDecoration: 'none' }}
+          >
+            + New Component
+          </a>
+        </div>
+
         <input
-          placeholder="Filter..."
-          value={filter}
-          onChange={e => setFilter(e.target.value)}
-          style={{ marginBottom: 16, width: 300 }}
+          type="search"
+          autoFocus
+          placeholder="Search components…"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          style={{
+            width: '100%',
+            padding: '10px 14px',
+            fontSize: 16,
+            border: '1px solid #ccc',
+            borderRadius: 6,
+            marginBottom: 16
+          }}
         />
-        <a href="/components/new" style={{ float: 'right' }}>+ New Component</a>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead>
-            <tr>
-              <th style={{ textAlign: 'left', padding: '8px', borderBottom: '1px solid #ccc' }}>Component</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map(name => (
-              <tr key={name}>
-                <td style={{ padding: '8px', borderBottom: '1px solid #eee' }}>
-                  <a href={`/components/${name}`}>{name}</a>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+
+        <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+          {filtered.length} of {sorted.length} components
+        </div>
+
+        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {filtered.map(name => (
+            <li key={name} style={{ borderBottom: '1px solid #eee' }}>
+              <a
+                href={`/components/${name}`}
+                style={{ display: 'block', padding: '10px 8px', color: '#0070d2', textDecoration: 'none' }}
+              >
+                {name}
+              </a>
+            </li>
+          ))}
+          {filtered.length === 0 && (
+            <li style={{ padding: 16, color: '#999', textAlign: 'center' }}>
+              No components match "{query}"
+            </li>
+          )}
+        </ul>
       </div>
     </Layout>
   );
@@ -941,17 +1101,22 @@ npm test -- test/routes/components.test.js
 router.get('/api/components/:name', requireJomax, async (req, res, next) => {
   try {
     const env = req.query.env || 'dev';
+    // Gate reads on allowlist/super-admin — users can only see components they have access to
+    await assertCanAccess(req.params.name, req.user.accountName, env);
     const manifest = await getCdsClient(env).get(`registry.${req.params.name}`);
     if (!manifest) return res.status(404).json({ error: 'Component not found' });
     res.json(manifest);
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
 });
 
 router.put('/api/components/:name', requireJomax, async (req, res, next) => {
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}`, req.body);
     res.json({ ok: true });
   } catch (err) {
@@ -1011,18 +1176,40 @@ export default function JsonEditor({ value, onChange, onValidate, readOnly = fal
 
 ```jsx
 // pages/components/[name].js
+// Single-page dashboard — every section visible at once, no tabs.
+// Each section is rendered as a "Card"; later tasks fill in their section's data fetching.
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Layout from '../../components/Layout.js';
 import JsonEditor from '../../components/JsonEditor.js';
 
-const TABS = ['Manifest', 'History', 'Sync', 'i18n', 'RUM', 'Access', 'Alerts'];
+function Card({ title, children, wide = false, actions }) {
+  return (
+    <section
+      style={{
+        gridColumn: wide ? '1 / -1' : 'span 1',
+        background: '#fff',
+        border: '1px solid #e5e5e5',
+        borderRadius: 6,
+        padding: 16,
+        boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
+      }}
+    >
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <h3 style={{ margin: 0, fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.5, color: '#666' }}>{title}</h3>
+        {actions}
+      </header>
+      {children}
+    </section>
+  );
+}
 
-export default function ComponentDetail() {
+export default function ComponentDashboard() {
   const router = useRouter();
   const { name } = router.query;
   const [env, setEnv] = useState('dev');
-  const [tab, setTab] = useState('Manifest');
+
+  // Manifest section state
   const [manifest, setManifest] = useState(null);
   const [editorValue, setEditorValue] = useState('');
   const [editorValid, setEditorValid] = useState(true);
@@ -1039,7 +1226,7 @@ export default function ComponentDetail() {
       });
   }, [name, env]);
 
-  async function handleSave() {
+  async function saveManifest() {
     setSaving(true);
     setSaveMsg('');
     const res = await fetch(`/api/components/${name}?env=${env}`, {
@@ -1053,55 +1240,93 @@ export default function ComponentDetail() {
 
   return (
     <Layout env={env} onEnvChange={setEnv}>
-      <div style={{ padding: 24 }}>
-        <a href="/">← Back</a>
-        <h1>{name}</h1>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16, borderBottom: '1px solid #ccc' }}>
-          {TABS.map(t => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              style={{
-                padding: '8px 16px',
-                border: 'none',
-                borderBottom: tab === t ? '2px solid #0070d2' : '2px solid transparent',
-                background: 'none',
-                cursor: 'pointer',
-                fontWeight: tab === t ? 'bold' : 'normal'
-              }}
-            >
-              {t}
-            </button>
-          ))}
+      <div style={{ padding: 24, maxWidth: 1400, margin: '0 auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+          <div>
+            <a href="/" style={{ fontSize: 12, color: '#666' }}>← All components</a>
+            <h1 style={{ margin: '4px 0' }}>{name}</h1>
+          </div>
           <a
             href={`/analytics?component=${name}`}
-            style={{ marginLeft: 'auto', padding: '8px 16px', color: '#0070d2' }}
+            style={{ padding: '8px 16px', border: '1px solid #0070d2', color: '#0070d2', borderRadius: 4, textDecoration: 'none' }}
           >
-            Analytics →
+            Full Analytics →
           </a>
         </div>
 
-        {tab === 'Manifest' && (
-          <div>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, 1fr)',
+          gap: 16
+        }}>
+          <Card title="Overview">
+            {manifest ? (
+              <dl style={{ margin: 0, fontSize: 13 }}>
+                <dt style={{ color: '#666' }}>Engine</dt>
+                <dd style={{ margin: '0 0 8px', fontFamily: 'monospace' }}>{manifest.engine || '—'}</dd>
+                <dt style={{ color: '#666' }}>JS file</dt>
+                <dd style={{ margin: '0 0 8px', fontFamily: 'monospace', wordBreak: 'break-all' }}>{manifest.js || '—'}</dd>
+                <dt style={{ color: '#666' }}>Last updated</dt>
+                <dd style={{ margin: 0 }}>{manifest.metaData?.updatedAt ? new Date(manifest.metaData.updatedAt).toLocaleString() : '—'}</dd>
+              </dl>
+            ) : <p>Loading…</p>}
+          </Card>
+
+          <Card title="Notes" /* Task 13 wires data fetching */>
+            <p style={{ color: '#999' }}>Notes section — filled in Task 13</p>
+          </Card>
+
+          <Card title="Manifest" wide actions={
+            <div>
+              {saveMsg && <span style={{ marginRight: 8, fontSize: 12, color: '#666' }}>{saveMsg}</span>}
+              <button onClick={saveManifest} disabled={!editorValid || saving}>
+                {saving ? 'Saving…' : 'Save Manifest'}
+              </button>
+            </div>
+          }>
             <JsonEditor
               value={editorValue}
               onChange={v => setEditorValue(v ?? '')}
               onValidate={setEditorValid}
+              height="360px"
             />
-            <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
-              <button onClick={handleSave} disabled={!editorValid || saving}>
-                {saving ? 'Saving…' : 'Save'}
-              </button>
-              {saveMsg && <span>{saveMsg}</span>}
-            </div>
-          </div>
-        )}
-        {tab !== 'Manifest' && <p style={{ color: '#999' }}>{tab} — wired up in later tasks</p>}
+          </Card>
+
+          <Card title="Access">
+            <p style={{ color: '#999' }}>Access section — filled in Task 11</p>
+          </Card>
+
+          <Card title="Alerts (Slack)">
+            <p style={{ color: '#999' }}>Alerts section — filled in Task 12</p>
+          </Card>
+
+          <Card title="i18n Version">
+            <p style={{ color: '#999' }}>i18n section — filled in Task 9</p>
+          </Card>
+
+          <Card title="RUM Config">
+            <p style={{ color: '#999' }}>RUM section — filled in Task 10</p>
+          </Card>
+
+          <Card title="Environment Sync" wide>
+            <p style={{ color: '#999' }}>Sync section — filled in Task 8</p>
+          </Card>
+
+          <Card title="Recent History" wide>
+            <p style={{ color: '#999' }}>History section — filled in Task 7</p>
+          </Card>
+
+          <Card title="Analytics — last 24h" wide>
+            <p style={{ color: '#999' }}>Inline mini-charts — filled in Task 14</p>
+          </Card>
+        </div>
       </div>
     </Layout>
   );
 }
 ```
+
+**Dashboard layout philosophy:** every piece of information about a component is on one scrollable page. The `Card` primitive provides consistent framing; each section fills its own card in later tasks. The `wide` prop spans both columns for sections that need horizontal space (manifest editor, sync table, history timeline, analytics charts).
 
 - [ ] **Step 7: Verify in browser** — navigate to a component, edit JSON, confirm save button disables on invalid JSON.
 
@@ -1119,7 +1344,7 @@ git commit -m "feat: manifest view/edit with Monaco JSON validation"
 **Files:**
 - Add to `routes/components.js`: GET `:name/history`, POST `:name/rollback`
 - Create: `components/HistoryTimeline.js`
-- Wire History tab in `pages/components/[name].js`
+- Fill in "Recent History" card in `pages/components/[name].js`
 
 - [ ] **Step 1: Add tests**
 
@@ -1173,7 +1398,7 @@ router.post('/api/components/:name/rollback', requireJomax, async (req, res, nex
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}`, req.body.value);
     res.json({ ok: true });
   } catch (err) {
@@ -1226,7 +1451,7 @@ export default function HistoryTimeline({ history, onRollback, loading }) {
 }
 ```
 
-- [ ] **Step 6: Wire History tab in [name].js**
+- [ ] **Step 6: Fill in the "Recent History" card in [name].js**
 
 In `pages/components/[name].js`, add state and data fetching for history, then replace the History placeholder:
 
@@ -1328,7 +1553,7 @@ router.post('/api/components/:name/sync', requireJomax, async (req, res, next) =
     const { fromEnv, toEnv } = req.body;
     // Check allowlist on the DESTINATION env — that's where the destructive write happens.
     // A user with dev access must NOT be able to push to prod.
-    await assertAllowlisted(name, req.user.accountName, toEnv);
+    await assertCanAccess(name, req.user.accountName, toEnv);
     const manifest = await getCdsClient(fromEnv).get(`registry.${name}`);
     await getCdsClient(toEnv).put(`registry.${name}`, manifest);
     res.json({ ok: true });
@@ -1397,7 +1622,7 @@ export default function SyncPanel({ componentName }) {
 }
 ```
 
-- [ ] **Step 5: Wire Sync tab in [name].js** — replace Sync placeholder with `<SyncPanel componentName={name} />`
+- [ ] **Step 5: Fill in the "Environment Sync" card in [name].js** — replace Sync placeholder with `<SyncPanel componentName={name} />`
 
 - [ ] **Step 6: Commit**
 
@@ -1413,7 +1638,7 @@ git commit -m "feat: environment sync for manifests"
 **Files:**
 - Create: `routes/i18n.js`
 - Create: `test/routes/i18n.test.js`
-- Wire i18n tab in `pages/components/[name].js`
+- Fill in "i18n Version" card in `pages/components/[name].js`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1476,7 +1701,7 @@ npm test -- test/routes/i18n.test.js
 import express from 'express';
 import { getCdsClient } from '../clients/switchboard.js';
 import { requireJomax } from '../middleware/require-jomax.js';
-import { assertAllowlisted } from '../lib/allowlist.js';
+import { assertCanAccess } from '../lib/access-control.js';
 
 const router = express.Router();
 
@@ -1493,7 +1718,7 @@ router.put('/api/components/:name/i18n', requireJomax, async (req, res, next) =>
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}.i18nVersion`, req.body.value);
     res.json({ ok: true });
   } catch (err) {
@@ -1514,7 +1739,7 @@ router.post('/api/components/:name/i18n/rollback', requireJomax, async (req, res
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}.i18nVersion`, req.body.value);
     res.json({ ok: true });
   } catch (err) {
@@ -1532,7 +1757,7 @@ export default router;
 npm test -- test/routes/i18n.test.js
 ```
 
-- [ ] **Step 5: Wire i18n tab in [name].js**
+- [ ] **Step 5: Fill in the "i18n Version" card in [name].js**
 
 Add state + fetch for i18n data, then replace the i18n placeholder:
 
@@ -1657,7 +1882,7 @@ test('PUT /api/components/:name/rum updates RUM config', async () => {
 import express from 'express';
 import { getCdsClient } from '../clients/switchboard.js';
 import { requireJomax } from '../middleware/require-jomax.js';
-import { assertAllowlisted } from '../lib/allowlist.js';
+import { assertCanAccess } from '../lib/access-control.js';
 
 const router = express.Router();
 
@@ -1674,7 +1899,7 @@ router.put('/api/components/:name/rum', requireJomax, async (req, res, next) => 
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}.rum`, req.body);
     res.json({ ok: true });
   } catch (err) {
@@ -1695,7 +1920,7 @@ router.post('/api/components/:name/rum/rollback', requireJomax, async (req, res,
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsClient(env).put(`registry.${name}.rum`, req.body.value);
     res.json({ ok: true });
   } catch (err) {
@@ -1709,7 +1934,7 @@ export default router;
 
 - [ ] **Step 4: Run tests — expect PASS**
 
-- [ ] **Step 5: Wire RUM tab in [name].js** — same pattern as i18n tab but use `<JsonEditor>` instead of `<input>` for the value.
+- [ ] **Step 5: Fill in the "RUM Config" card in [name].js** — same pattern as i18n tab but use `<JsonEditor>` instead of `<input>` for the value.
 
 - [ ] **Step 6: Commit**
 
@@ -1786,7 +2011,7 @@ test('PUT /api/access/:name rejects empty jomax array (lockout prevention)', asy
 import express from 'express';
 import { getCdsAuthClient } from '../clients/switchboard.js';
 import { requireJomax } from '../middleware/require-jomax.js';
-import { assertAllowlisted } from '../lib/allowlist.js';
+import { assertCanAccess } from '../lib/access-control.js';
 
 const router = express.Router();
 
@@ -1803,7 +2028,7 @@ router.put('/api/access/:name', requireJomax, async (req, res, next) => {
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     const newJomax = Array.isArray(req.body.jomax) ? req.body.jomax : [];
     // Never allow the allowlist to be emptied — that locks everyone out.
     if (newJomax.length === 0) {
@@ -1905,7 +2130,7 @@ export default function AccessList({ componentName, env }) {
 }
 ```
 
-- [ ] **Step 5: Wire Access tab in [name].js** — replace Access placeholder with `<AccessList componentName={name} env={env} />`
+- [ ] **Step 5: Fill in the "Access" card in [name].js** — replace Access placeholder with `<AccessList componentName={name} env={env} />`
 
 - [ ] **Step 6: Run tests — expect PASS + commit**
 
@@ -1990,7 +2215,7 @@ export async function sendSlackMessage(webhookUrl, text) {
 import express from 'express';
 import { getCdsAdminClient } from '../clients/switchboard.js';
 import { requireJomax } from '../middleware/require-jomax.js';
-import { assertAllowlisted } from '../lib/allowlist.js';
+import { assertCanAccess } from '../lib/access-control.js';
 import { sendSlackMessage } from '../clients/slack.js';
 
 const router = express.Router();
@@ -2007,7 +2232,7 @@ router.put('/api/alerts/:name', requireJomax, async (req, res, next) => {
   try {
     const { name } = req.params;
     const env = req.query.env || 'dev';
-    await assertAllowlisted(name, req.user.accountName, env);
+    await assertCanAccess(name, req.user.accountName, env);
     await getCdsAdminClient(env).put(`config.${name}`, { slackWebhookUrl: req.body.slackWebhookUrl });
     res.json({ ok: true });
   } catch (err) {
@@ -2031,7 +2256,7 @@ export default router;
 
 - [ ] **Step 5: Run tests — expect PASS**
 
-- [ ] **Step 6: Wire Alerts tab in [name].js** with webhook URL input, save button, and test button.
+- [ ] **Step 6: Fill in the "Alerts (Slack)" card in [name].js** with webhook URL input, save button, and test button.
 
 - [ ] **Step 7: Commit**
 
@@ -2042,7 +2267,221 @@ git commit -m "feat: slack webhook alerts config"
 
 ---
 
-## Task 13: Elasticsearch Client
+## Task 13: Notes (markdown, no history)
+
+**Files:**
+- Create: `routes/notes.js`
+- Create: `test/routes/notes.test.js`
+- Create: `components/MarkdownNotes.js`
+- Modify: `pages/components/[name].js` (fill in Notes card)
+
+- [ ] **Step 1: Write failing tests**
+
+```js
+// test/routes/notes.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockCdsGet = jest.fn();
+const mockCdsPut = jest.fn();
+const mockCdsAuthGet = jest.fn().mockResolvedValue({ jomax: ['jroig'] });
+const mockCdsAdminGet = jest.fn().mockResolvedValue({ jomax: [] });
+
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsClient: jest.fn(() => ({ get: mockCdsGet, put: mockCdsPut })),
+  getCdsAuthClient: jest.fn(() => ({ get: mockCdsAuthGet })),
+  getCdsAdminClient: jest.fn(() => ({ get: mockCdsAdminGet }))
+}));
+jest.unstable_mockModule('../../middleware/require-jomax.js', () => ({
+  requireJomax: (req, res, next) => { req.user = { accountName: 'jroig' }; next(); }
+}));
+
+const { default: router } = await import('../../routes/notes.js');
+const app = express();
+app.use(express.json());
+app.use(router);
+
+test('GET /api/components/:name/notes returns markdown string', async () => {
+  mockCdsGet.mockResolvedValue('# Deployment notes\n\nRolled back due to LCP regression.');
+  const res = await request(app).get('/api/components/componentA/notes?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '# Deployment notes\n\nRolled back due to LCP regression.' });
+});
+
+test('GET /api/components/:name/notes returns empty when unset', async () => {
+  mockCdsGet.mockResolvedValue(null);
+  const res = await request(app).get('/api/components/componentA/notes?env=dev');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '' });
+});
+
+test('PUT /api/components/:name/notes writes the markdown', async () => {
+  mockCdsPut.mockResolvedValue();
+  const res = await request(app)
+    .put('/api/components/componentA/notes?env=dev')
+    .send({ value: '## New notes' });
+  expect(res.status).toBe(200);
+  expect(mockCdsPut).toHaveBeenCalledWith('registry.componentA.notes', '## New notes');
+});
+
+test('PUT /api/components/:name/notes rejects non-string body', async () => {
+  const res = await request(app)
+    .put('/api/components/componentA/notes?env=dev')
+    .send({ value: { not: 'a string' } });
+  expect(res.status).toBe(400);
+});
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+
+```bash
+npm test -- test/routes/notes.test.js
+```
+
+- [ ] **Step 3: Create routes/notes.js**
+
+```js
+// routes/notes.js
+// Notes are stored as a markdown string in registry.{name}.notes.
+// No history/rollback — just get/put. Caller must have access to the component.
+import express from 'express';
+import { getCdsClient } from '../clients/switchboard.js';
+import { requireJomax } from '../middleware/require-jomax.js';
+import { assertCanAccess } from '../lib/access-control.js';
+
+const router = express.Router();
+
+router.get('/api/components/:name/notes', requireJomax, async (req, res, next) => {
+  try {
+    const env = req.query.env || 'dev';
+    await assertCanAccess(req.params.name, req.user.accountName, env);
+    const value = await getCdsClient(env).get(`registry.${req.params.name}.notes`);
+    res.json({ value: value ?? '' });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.put('/api/components/:name/notes', requireJomax, async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const env = req.query.env || 'dev';
+    await assertCanAccess(name, req.user.accountName, env);
+    if (typeof req.body.value !== 'string') {
+      return res.status(400).json({ error: 'value must be a string' });
+    }
+    await getCdsClient(env).put(`registry.${name}.notes`, req.body.value);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+export default router;
+```
+
+- [ ] **Step 4: Run tests — expect PASS**
+
+- [ ] **Step 5: Create components/MarkdownNotes.js**
+
+```jsx
+// components/MarkdownNotes.js
+// Editable markdown with a preview/split toggle. Debounces saves while typing.
+import { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
+
+export default function MarkdownNotes({ componentName, env }) {
+  const [value, setValue] = useState('');
+  const [mode, setMode] = useState('split');  // 'edit' | 'preview' | 'split'
+  const [status, setStatus] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    fetch(`/api/components/${componentName}/notes?env=${env}`)
+      .then(r => r.json())
+      .then(data => { setValue(data.value ?? ''); setLoaded(true); });
+  }, [componentName, env]);
+
+  // Debounced auto-save (1.5s after typing stops)
+  useEffect(() => {
+    if (!loaded) return;
+    clearTimeout(saveTimer.current);
+    setStatus('editing…');
+    saveTimer.current = setTimeout(async () => {
+      setStatus('saving…');
+      const res = await fetch(`/api/components/${componentName}/notes?env=${env}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value })
+      });
+      setStatus(res.ok ? 'saved' : 'save failed');
+      setTimeout(() => setStatus(''), 1500);
+    }, 1500);
+    return () => clearTimeout(saveTimer.current);
+  }, [value]);
+
+  if (!loaded) return <p>Loading…</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 8, fontSize: 12 }}>
+        {['edit', 'split', 'preview'].map(m => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            style={{ padding: '2px 8px', fontWeight: mode === m ? 'bold' : 'normal' }}
+          >
+            {m}
+          </button>
+        ))}
+        <span style={{ marginLeft: 'auto', color: '#666' }}>{status}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: mode === 'split' ? '1fr 1fr' : '1fr', gap: 12 }}>
+        {(mode === 'edit' || mode === 'split') && (
+          <textarea
+            value={value}
+            onChange={e => setValue(e.target.value)}
+            placeholder="# Add notes in markdown…"
+            style={{ width: '100%', minHeight: 180, fontFamily: 'monospace', fontSize: 13, padding: 8, border: '1px solid #ccc', borderRadius: 4 }}
+          />
+        )}
+        {(mode === 'preview' || mode === 'split') && (
+          <div style={{ border: '1px solid #eee', borderRadius: 4, padding: 12, minHeight: 180, background: '#fafafa' }}>
+            {value ? <ReactMarkdown>{value}</ReactMarkdown> : <p style={{ color: '#999', margin: 0 }}>No notes yet.</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Fill in the Notes card on the dashboard**
+
+In `pages/components/[name].js`:
+
+```jsx
+import MarkdownNotes from '../../components/MarkdownNotes.js';
+// ...
+<Card title="Notes">
+  {name && <MarkdownNotes componentName={name} env={env} />}
+</Card>
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add routes/notes.js test/routes/notes.test.js components/MarkdownNotes.js pages/components/[name].js
+git commit -m "feat: markdown notes per component (auto-save, live preview)"
+```
+
+---
+
+## Task 14: Elasticsearch Client
 
 **Files:**
 - Create: `clients/elasticsearch.js`
@@ -2212,7 +2651,7 @@ git commit -m "feat: elasticsearch client with error/volume/RUM queries"
 
 ---
 
-## Task 14: Analytics API Routes + Page
+## Task 15: Analytics API Routes + Page + Dashboard Mini-Charts
 
 **Files:**
 - Create: `routes/analytics.js`
@@ -2482,7 +2921,69 @@ export default function Analytics() {
 }
 ```
 
-- [ ] **Step 7: Wire Analytics tab in [name].js** — link tab to `/analytics?component={name}` (new page, not inline tab).
+- [ ] **Step 7: Create components/charts/MiniChart.js**
+
+Compact sparkline shown in the dashboard's Analytics card — one chart per metric (errors, volume, LCP p75).
+
+```jsx
+// components/charts/MiniChart.js
+import { LineChart, Line, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
+
+export default function MiniChart({ data, dataKey, color, label, unit = '' }) {
+  const latest = data?.length ? data[data.length - 1][dataKey] : null;
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: 4, padding: 12 }}>
+      <div style={{ fontSize: 11, color: '#666', textTransform: 'uppercase', letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 'bold', marginBottom: 4 }}>
+        {latest != null ? `${Math.round(latest)}${unit}` : '—'}
+      </div>
+      <ResponsiveContainer width="100%" height={60}>
+        <LineChart data={data}>
+          <YAxis hide domain={['auto', 'auto']} />
+          <Tooltip />
+          <Line type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 8: Fill in the "Analytics — last 24h" card in pages/components/[name].js**
+
+```jsx
+import MiniChart from '../../components/charts/MiniChart.js';
+
+// Inside the dashboard component — add state + effect:
+const [miniErrors, setMiniErrors] = useState({ total: 0, buckets: [] });
+const [miniVolume, setMiniVolume] = useState({ buckets: [] });
+const [miniVitals, setMiniVitals] = useState({ buckets: [] });
+
+useEffect(() => {
+  if (!name) return;
+  const p = `component=${name}&from=now-1d&to=now`;
+  Promise.all([
+    fetch(`/api/analytics/errors?${p}`).then(r => r.json()),
+    fetch(`/api/analytics/volume?${p}`).then(r => r.json()),
+    fetch(`/api/analytics/vitals?${p}`).then(r => r.json())
+  ]).then(([e, v, w]) => {
+    setMiniErrors(e);
+    setMiniVolume(v);
+    setMiniVitals(w);
+  });
+}, [name]);
+
+// Replace the Analytics card:
+<Card title="Analytics — last 24h" wide actions={
+  <a href={`/analytics?component=${name}`} style={{ fontSize: 12, color: '#0070d2' }}>Full analytics →</a>
+}>
+  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+    <MiniChart data={miniErrors.buckets} dataKey="count" color="#e53e3e" label={`Errors (${miniErrors.total} total)`} />
+    <MiniChart data={miniVolume.buckets} dataKey="count" color="#38a169" label="Request volume" />
+    <MiniChart data={miniVitals.buckets} dataKey="lcp_p75" color="#3182ce" label="LCP p75" unit="ms" />
+  </div>
+</Card>
+```
 
 - [ ] **Step 8: Commit**
 
@@ -2494,7 +2995,7 @@ git commit -m "feat: analytics dashboard with errors, volume, and web vitals"
 
 ---
 
-## Task 15: Connect-gd-auth Wiring + _app.js Auth Gate
+## Task 16: Connect-gd-auth Wiring + _app.js Auth Gate
 
 **Files:**
 - Modify: `pages/_app.js`
@@ -2582,22 +3083,39 @@ git commit -m "feat: connect-gd-auth SSO gate"
 ## Verification Checklist
 
 - [ ] `npm run local` — dev server starts, no startup errors
-- [ ] `/` — component list loads from Switchboard dev env
-- [ ] `/components/new` — create a test component, confirm 3 Switchboard entries created (cds, cds-auth, cds-admin)
-- [ ] `/components/{name}` Manifest tab — Monaco loads, invalid JSON disables Save, valid JSON saves
-- [ ] History tab — entries appear, Rollback reverts and updates manifest view
-- [ ] Sync tab — prod→test copy shows in Switchboard
-- [ ] i18n tab — set hash, confirm key created; rollback reverts
-- [ ] RUM tab — set JSON config, confirm JSON validation works
-- [ ] Access tab — add/remove jomax users, confirm cds-auth updated
-- [ ] Alerts tab — enter webhook URL, test message fires to Slack
-- [ ] Analytics page — select component, charts render (errors, volume, vitals)
+- [ ] `/` — list loads; search box filters case-insensitively while you type; alpha-sorted
+- [ ] As regular user, list shows ONLY components where you're in cds-auth jomax allowlist
+- [ ] After adding your jomax user to `cds-admin.admins.jomax`, reload — full list appears
+- [ ] `/components/new` — create a test component, confirm 3 Switchboard entries (cds, cds-auth, cds-admin)
+- [ ] `/components/{name}` — single dashboard page with all cards visible (no tabs)
+- [ ] Manifest card — invalid JSON disables Save, valid JSON saves
+- [ ] Notes card — markdown with edit/split/preview, auto-saves after 1.5s, stored under `registry.{name}.notes`
+- [ ] Recent History card — entries appear; Rollback reverts and updates manifest
+- [ ] Env Sync card — prod→test; allowlist check on DESTINATION env enforced
+- [ ] i18n card — set hash; sub-key history works; rollback reverts
+- [ ] RUM card — set JSON config; JSON validation blocks invalid save
+- [ ] Access card — add/remove jomax users; last-user removal blocked
+- [ ] Alerts card — set webhook, send test message
+- [ ] Analytics card — shows last-24h sparklines; "Full analytics →" navigates to `/analytics?component={name}`
+- [ ] `/analytics` — component dropdown, time ranges, full charts
+- [ ] Try accessing another team's component URL directly — 403
 - [ ] `npm test` — all tests pass
 - [ ] Deploy to Katana dev — IAM writes succeed without cert env vars
 
 ---
 
 ## Revision Notes
+
+**v3 changes (single-page dashboard + access control):**
+
+- **Single-page dashboard** — component detail page is now a grid of `Card` sections (Overview, Notes, Manifest, Access, Alerts, i18n, RUM, Sync, Recent History, Analytics) instead of tabs. Everything about a component is visible on one page.
+- **Notes feature** — new `registry.{name}.notes` Switchboard key (markdown string, no history). New `routes/notes.js`, `components/MarkdownNotes.js` with edit/split/preview modes and debounced auto-save. Task 13.
+- **Super-admin bypass** — new `cds-admin.admins` Switchboard key (`{ jomax: [...] }`) lists users who bypass all per-component access checks. Not editable via the app.
+- **Read access gating** — previously, any Jomax user could read any component. Now reads also require allowlist membership (or super-admin). New `lib/access-control.js` exposes `isSuperAdmin`, `canAccess`, `assertCanAccess`, `listAccessibleComponents`. All detail GETs call `assertCanAccess`.
+- **Component list filtering** — `GET /api/components` filters to components the user is allowlisted on (super admins see all).
+- **Prominent alpha-sorted search list** — `pages/index.js` gets a full-width search box, case-insensitive match anywhere in the name, locale-aware alpha sort.
+- **Inline mini-charts** — Analytics card on the dashboard shows last-24h sparklines for errors, volume, LCP p75 with a link to `/analytics` for deeper dive.
+- **File renames** — `lib/allowlist.js` → `lib/access-control.js`; `assertAllowlisted` → `assertCanAccess` everywhere.
 
 **v2 fixes applied after review:**
 
