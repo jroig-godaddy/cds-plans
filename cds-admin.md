@@ -20,7 +20,7 @@ cds-admin/
 ├── .env.local.example
 ├── clients/
 │   ├── switchboard.js               # ConfigClient factory — one instance per (app,env)
-│   ├── elasticsearch.js             # ES client wrapper with query helpers
+│   ├── elasticsearch.js             # ES client wrappers — getLogsClient() for errors/volume, getRumClient() for web vitals
 │   └── slack.js                     # Slack incoming webhook sender
 ├── plugins/
 │   └── switchboard-auth.js          # Injects cert/IAM into ConfigClient at prepare
@@ -147,12 +147,23 @@ import switchboardAuth from './plugins/switchboard-auth.js';
 export default makeGasket({
   plugins: [pluginNextjs, pluginExpress, pluginLogger, switchboardAuth],
   express: { routes: './routes/**/*.js' },
-  hostname: process.env.HOSTNAME || 'cds-admin.int.test-gdcorp.tools',
   environments: {
-    local: { env: 'dev' },
-    dev:   { env: 'dev' },
-    test:  { env: 'test' },
-    prod:  { env: 'prod' }
+    local: {
+      hostname: 'localhost',
+      auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+    },
+    dev: {
+      hostname: 'cds-admin.int.dev-gdcorp.tools',
+      auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+    },
+    test: {
+      hostname: 'cds-admin.int.test-gdcorp.tools',
+      auth: { host: 'sso.test-godaddy.com', ssoRedirect: 'https://sso.test-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+    },
+    prod: {
+      hostname: 'cds-admin.int.gdcorp.tools',
+      auth: { host: 'sso.godaddy.com', ssoRedirect: 'https://sso.gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+    }
   }
 });
 ```
@@ -177,8 +188,18 @@ export default makeGasket({
 ```bash
 # .env.local.example
 GASKET_ENV=local
-ELASTICSEARCH_URL=https://usiessp-prod-usw2.kb.us-west-2.aws.found.io:9243
-ELASTICSEARCH_API_KEY=
+# Logs cluster — errors + request volume (.ds-cds-api-prod-logs-*)
+ELASTICSEARCH_LOGS_URL=https://<logs-cluster>.us-west-2.aws.found.io:9243
+ELASTICSEARCH_LOGS_API_KEY=
+
+# RUM cluster — web vitals (sns-traffic-c1-prod*)
+ELASTICSEARCH_RUM_URL=https://<rum-cluster>.us-west-2.aws.found.io:9243
+ELASTICSEARCH_RUM_API_KEY=
+
+# Kibana dashboard deep-link base URLs (NEXT_PUBLIC_ = exposed to browser bundle)
+# Append ?_a=(query:(language:kuery,query:'...')) to pre-filter by component
+NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL=https://<logs-kibana>/app/dashboards#/view/<dashboard-id>
+NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL=https://<rum-kibana>/app/dashboards#/view/<dashboard-id>
 
 # Local dev auth — use ONE of:
 SWITCHBOARD_CERT_PATH=/path/to/your.crt
@@ -191,7 +212,7 @@ SWITCHBOARD_JWT=<token from ssojwt CLI>
 # SWITCHBOARD_IAM_KEY_PATH=
 
 SESSION_SECRET=dev-secret-change-in-prod
-SSO_HOST=sso.int.test-gdcorp.tools
+# SSO host is configured per-environment in gasket.js environments block — no env var needed
 ```
 
 - [ ] **Step 6: Create jest.config.js** (required for ESM tests)
@@ -2493,27 +2514,37 @@ git commit -m "feat: markdown notes per component (auto-save, live preview)"
 // test/clients/elasticsearch.test.js
 import { jest } from '@jest/globals';
 
+const mockLogsSearch = jest.fn().mockResolvedValue({ hits: { total: { value: 5 } }, aggregations: {} });
+const mockRumSearch = jest.fn().mockResolvedValue({ hits: { total: { value: 0 } }, aggregations: {} });
+
 jest.unstable_mockModule('@elastic/elasticsearch', () => ({
-  Client: jest.fn().mockImplementation(() => ({
-    search: jest.fn().mockResolvedValue({ hits: { total: { value: 5 } }, aggregations: {} })
+  Client: jest.fn().mockImplementation(({ node }) => ({
+    search: node.includes('rum') ? mockRumSearch : mockLogsSearch
   }))
 }));
 
-process.env.ELASTICSEARCH_URL = 'https://es.example.com';
-process.env.ELASTICSEARCH_API_KEY = 'dGVzdDp0ZXN0';
+process.env.ELASTICSEARCH_LOGS_URL = 'https://logs.example.com';
+process.env.ELASTICSEARCH_LOGS_API_KEY = 'bG9nczp0ZXN0';
+process.env.ELASTICSEARCH_RUM_URL = 'https://rum.example.com';
+process.env.ELASTICSEARCH_RUM_API_KEY = 'cnVtOnRlc3Q=';
 
-const { getEsClient, queryErrors, queryRequestVolume, queryWebVitals } = await import('../../clients/elasticsearch.js');
+const { getLogsClient, getRumClient, queryErrors, queryRequestVolume, queryWebVitals } = await import('../../clients/elasticsearch.js');
 
-test('getEsClient returns singleton', () => {
-  const a = getEsClient();
-  const b = getEsClient();
+test('getLogsClient returns singleton', () => {
+  const a = getLogsClient();
+  const b = getLogsClient();
   expect(a).toBe(b);
 });
 
-test('queryErrors calls search on correct index with event.type filter', async () => {
-  const client = getEsClient();
+test('getRumClient returns singleton distinct from logs client', () => {
+  const logs = getLogsClient();
+  const rum = getRumClient();
+  expect(logs).not.toBe(rum);
+});
+
+test('queryErrors calls search on logs cluster with correct index', async () => {
   await queryErrors('myComponent', 'now-1d', 'now');
-  expect(client.search).toHaveBeenCalledWith(expect.objectContaining({
+  expect(mockLogsSearch).toHaveBeenCalledWith(expect.objectContaining({
     index: '.ds-cds-api-prod-logs-*',
     body: expect.objectContaining({
       query: expect.objectContaining({
@@ -2528,10 +2559,9 @@ test('queryErrors calls search on correct index with event.type filter', async (
   }));
 });
 
-test('queryWebVitals calls search on RUM index with componentType filter', async () => {
-  const client = getEsClient();
+test('queryWebVitals calls search on RUM cluster with correct index', async () => {
   await queryWebVitals('myComponent', 'now-1d', 'now');
-  expect(client.search).toHaveBeenCalledWith(expect.objectContaining({
+  expect(mockRumSearch).toHaveBeenCalledWith(expect.objectContaining({
     index: 'sns-traffic-c1-prod*'
   }));
 });
@@ -2543,22 +2573,35 @@ test('queryWebVitals calls search on RUM index with componentType filter', async
 
 ```js
 // clients/elasticsearch.js
+// Two separate Elastic clusters: logs (errors + volume) and RUM (web vitals).
+// Each has its own URL and API key — see .env.local.example.
 import { Client } from '@elastic/elasticsearch';
 
-let esClient;
+let logsClient;
+let rumClient;
 
-export function getEsClient() {
-  if (!esClient) {
-    esClient = new Client({
-      node: process.env.ELASTICSEARCH_URL,
-      auth: { apiKey: process.env.ELASTICSEARCH_API_KEY }
+export function getLogsClient() {
+  if (!logsClient) {
+    logsClient = new Client({
+      node: process.env.ELASTICSEARCH_LOGS_URL,
+      auth: { apiKey: process.env.ELASTICSEARCH_LOGS_API_KEY }
     });
   }
-  return esClient;
+  return logsClient;
+}
+
+export function getRumClient() {
+  if (!rumClient) {
+    rumClient = new Client({
+      node: process.env.ELASTICSEARCH_RUM_URL,
+      auth: { apiKey: process.env.ELASTICSEARCH_RUM_API_KEY }
+    });
+  }
+  return rumClient;
 }
 
 export async function queryErrors(componentName, from, to) {
-  return getEsClient().search({
+  return getLogsClient().search({
     index: '.ds-cds-api-prod-logs-*',
     body: {
       size: 0,
@@ -2590,7 +2633,7 @@ export async function queryRequestVolume(componentName, from, to) {
   //   ...componentTypes=foo,bamMediaManagerEsm&other=x
   //   ...componentTypes=bamMediaManagerEsm,baz
   const escaped = componentName.replace(/[.?+*|{}[\]()"\\]/g, '\\$&');
-  return getEsClient().search({
+  return getLogsClient().search({
     index: '.ds-cds-api-prod-logs-*',
     body: {
       size: 0,
@@ -2613,7 +2656,7 @@ export async function queryRequestVolume(componentName, from, to) {
 }
 
 export async function queryWebVitals(componentName, from, to) {
-  return getEsClient().search({
+  return getRumClient().search({
     index: 'sns-traffic-c1-prod*',
     body: {
       size: 0,
@@ -2847,6 +2890,15 @@ const TIME_RANGES = [
   { label: '7d',  value: 'now-7d' }
 ];
 
+// Build a Kibana deep-link that pre-filters the dashboard to a specific component.
+// Kibana's _a param accepts a KQL query via URL state; encoding it lets the dashboard
+// open already filtered without the user having to type anything.
+function kibanaLink(baseUrl, kqlQuery) {
+  if (!baseUrl) return null;
+  const state = `(query:(language:kuery,query:'${kqlQuery}'))`;
+  return `${baseUrl}&_a=${encodeURIComponent(state)}`;
+}
+
 export default function Analytics() {
   const [components, setComponents] = useState([]);
   const [component, setComponent] = useState('');
@@ -2855,6 +2907,9 @@ export default function Analytics() {
   const [volume, setVolume] = useState({ buckets: [] });
   const [vitals, setVitals] = useState({ buckets: [] });
   const [loading, setLoading] = useState(false);
+
+  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
+  const rumBase  = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
 
   useEffect(() => {
     fetch('/api/components?env=prod').then(r => r.json()).then(names => {
@@ -2878,6 +2933,9 @@ export default function Analytics() {
       setLoading(false);
     });
   }, [component, range]);
+
+  const logsLink = component ? kibanaLink(logsBase, `event.type:"${component}"`) : null;
+  const rumLink  = component ? kibanaLink(rumBase,  `customProps.media_library.componentType:"${component}"`) : null;
 
   return (
     <Layout>
@@ -2903,15 +2961,24 @@ export default function Analytics() {
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
           <div>
-            <h3>Errors over time <span style={{ fontSize: 20, fontWeight: 'bold', marginLeft: 8 }}>{errors.total}</span> total</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3>Errors over time <span style={{ fontSize: 20, fontWeight: 'bold', marginLeft: 8 }}>{errors.total}</span> total</h3>
+              {logsLink && <a href={logsLink} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+            </div>
             <ErrorsOverTime data={errors.buckets} />
           </div>
           <div>
-            <h3>Request volume</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3>Request volume</h3>
+              {logsLink && <a href={logsLink} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+            </div>
             <RequestVolume data={volume.buckets} />
           </div>
           <div style={{ gridColumn: '1 / -1' }}>
-            <h3>Web Vitals (p75)</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <h3>Web Vitals (p75)</h3>
+              {rumLink && <a href={rumLink} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+            </div>
             <WebVitals data={vitals.buckets} />
           </div>
         </div>
@@ -3003,7 +3070,7 @@ git commit -m "feat: analytics dashboard with errors, volume, and web vitals"
 
 - [ ] **Step 1: Add connect-gd-auth middleware to gasket.js**
 
-`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register the middleware via a plugin hook. The hook must be `async` because Gasket 7's `middleware` lifecycle is async.
+`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register the middleware via a plugin hook. The hook must be `async` because Gasket 7's `middleware` lifecycle is async. The `gasket` argument carries the per-environment `config.auth` object, so the SSO host is picked up automatically from the environments block — no env var needed.
 
 ```js
 // Add to the TOP of gasket.js (alongside other imports):
@@ -3015,14 +3082,16 @@ const gdAuth = require('connect-gd-auth');
 {
   name: 'cds-admin-auth',
   hooks: {
-    async middleware() {
+    async middleware(gasket) {
+      const { auth = {} } = gasket.config;
       return [
         gdAuth({
           appName: 'cds-admin',
           verify: gdAuth.risk.low,
           types: ['jomax'],
           auth: ['basic'],
-          host: process.env.SSO_HOST || 'sso.int.test-gdcorp.tools'
+          host: auth.host,
+          ssoRedirect: auth.ssoRedirect
         })
       ];
     }
