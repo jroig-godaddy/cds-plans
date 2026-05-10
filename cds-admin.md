@@ -70,6 +70,7 @@ cds-admin/
 │   └── access-control.js            # isSuperAdmin, canAccess, assertCanAccess (reads + writes)
 ├── routes/
 │   ├── auth.js                      # GET /auth/me, POST /auth/logout
+│   ├── config.js                    # GET /api/config — public non-secret config (kibanaDashboards per env)
 │   ├── components.js                # registry.{name}: list (filtered), get, put, create, history, rollback, sync
 │   ├── i18n.js                      # registry.{name}.i18nVersion: get, put, history, rollback
 │   ├── rum.js                       # registry.{name}.rum: get, put, history, rollback
@@ -200,22 +201,38 @@ export default makeGasket({
     local: {
       hostname: 'localhost',
       awsProfile: 'cds-admin-dev-sso',
-      auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+      auth: { host: 'sso.dev-godaddy.com', ssoBase: 'https://sso.dev-gdcorp.tools' },
+      kibanaDashboards: {
+        logs: 'https://<logs-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
+        rum:  'https://<rum-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      }
     },
     dev: {
       hostname: 'cds-admin.int.dev-gdcorp.tools',
       awsProfile: 'cds-admin-dev-sso',
-      auth: { host: 'sso.dev-godaddy.com', ssoRedirect: 'https://sso.dev-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+      auth: { host: 'sso.dev-godaddy.com', ssoBase: 'https://sso.dev-gdcorp.tools' },
+      kibanaDashboards: {
+        logs: 'https://<logs-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
+        rum:  'https://<rum-cluster-dev>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      }
     },
     test: {
       hostname: 'cds-admin.int.test-gdcorp.tools',
       awsProfile: 'cds-admin-test-sso',
-      auth: { host: 'sso.test-godaddy.com', ssoRedirect: 'https://sso.test-gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+      auth: { host: 'sso.test-godaddy.com', ssoBase: 'https://sso.test-gdcorp.tools' },
+      kibanaDashboards: {
+        logs: 'https://<logs-cluster-test>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
+        rum:  'https://<rum-cluster-test>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      }
     },
     prod: {
       hostname: 'cds-admin.int.gdcorp.tools',
       awsProfile: null,  // Katana injects IAM role directly — no profile needed
-      auth: { host: 'sso.godaddy.com', ssoRedirect: 'https://sso.gdcorp.tools/?realm=jomax&app=cds-admin&path=/' }
+      auth: { host: 'sso.godaddy.com', ssoBase: 'https://sso.gdcorp.tools' },
+      kibanaDashboards: {
+        logs: 'https://<logs-cluster-prod>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<logs-dashboard-id>',
+        rum:  'https://<rum-cluster-prod>.kb.us-west-2.aws.found.io:9243/app/dashboards#/view/<rum-dashboard-id>'
+      }
     }
   }
 });
@@ -238,26 +255,31 @@ export default makeGasket({
 
 - [ ] **Step 5: Create .env.local.example**
 
+Copy to `.env.local` (git-ignored) and fill in the ES API keys before running locally. For dev/test/prod deployments, these same env vars are injected by Katana secrets — no `.env.local` file is used there.
+
 ```bash
-# .env.local.example
+# .env.local.example  ← copy to .env.local and fill in values; never commit .env.local
 GASKET_ENV=local
+
+# ── Elasticsearch API keys ─────────────────────────────────────────────────────
+# LOCAL:       set here in .env.local (get keys from the Elastic Cloud console)
+# DEV/TEST/PROD: injected automatically by Katana secrets — no file needed
+
 # Logs cluster — errors + request volume (.ds-cds-api-prod-logs-*)
-ELASTICSEARCH_LOGS_URL=https://<logs-cluster>.us-west-2.aws.found.io:9243
+ELASTICSEARCH_LOGS_URL=https://<logs-cluster>.es.us-west-2.aws.found.io:9243
 ELASTICSEARCH_LOGS_API_KEY=
 
 # RUM cluster — web vitals (sns-traffic-c1-prod*)
-ELASTICSEARCH_RUM_URL=https://<rum-cluster>.us-west-2.aws.found.io:9243
+ELASTICSEARCH_RUM_URL=https://<rum-cluster>.es.us-west-2.aws.found.io:9243
 ELASTICSEARCH_RUM_API_KEY=
 
-# Kibana dashboard deep-link base URLs (NEXT_PUBLIC_ = exposed to browser bundle)
-# Append ?_a=(query:(language:kuery,query:'...')) to pre-filter by component
-NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL=https://<logs-kibana>/app/dashboards#/view/<dashboard-id>
-NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL=https://<rum-kibana>/app/dashboards#/view/<dashboard-id>
-
+# ── Other ──────────────────────────────────────────────────────────────────────
 SESSION_SECRET=dev-secret-change-in-prod
 # SSO host is configured per-environment in gasket.js environments block — no env var needed
 # AWS profile is configured per-environment in gasket.js (awsProfile field)
 # Run `aws sso login --profile cds-admin-dev-sso` before starting locally
+# Kibana dashboard base URLs are configured per-environment in gasket.js (kibanaDashboards.logs / .rum)
+# Fill in the placeholder cluster names and dashboard IDs in gasket.js before running
 ```
 
 - [ ] **Step 6: Create scripts/check-aws-sso.js**
@@ -466,7 +488,7 @@ git commit -m "feat: switchboard client factory with IAM role auth"
 
 ---
 
-## Task 3: Auth Middleware + Auth Route + Error Handler + CSRF
+## Task 3: Auth Middleware + Auth Route + Config Route + Error Handler + CSRF
 
 **Files:**
 - Create: `middleware/require-jomax.js`
@@ -474,9 +496,11 @@ git commit -m "feat: switchboard client factory with IAM role auth"
 - Create: `middleware/error-handler.js`
 - Create: `lib/access-control.js`
 - Create: `routes/auth.js`
+- Create: `routes/config.js`
 - Create: `test/middleware/require-jomax.test.js`
 - Create: `test/middleware/require-same-origin.test.js`
 - Create: `test/lib/access-control.test.js`
+- Create: `test/routes/config.test.js`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -723,15 +747,72 @@ router.post('/auth/logout', (req, res) => {
 export default router;
 ```
 
-- [ ] **Step 8: Wire middleware in gasket.js**
+- [ ] **Step 8: Create routes/config.js** (public non-secret config for the browser)
 
-Add a plugin hook that registers `requireSameOrigin` globally and `errorHandler` as the final handler:
+```js
+// routes/config.js
+// Exposes non-sensitive per-env config to the client. No auth required —
+// these are just URLs the browser needs to build Kibana deep-links.
+import express from 'express';
+
+const router = express.Router();
+
+router.get('/api/config', (req, res) => {
+  const { kibanaDashboards = {} } = req.app.config ?? {};
+  res.json({ kibanaDashboards });
+});
+
+export default router;
+```
+
+Write the test:
+
+```js
+// test/routes/config.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const { default: router } = await import('../../routes/config.js');
+const app = express();
+app.config = {
+  kibanaDashboards: {
+    logs: 'https://logs.kb.example.com/app/dashboards#/view/abc',
+    rum:  'https://rum.kb.example.com/app/dashboards#/view/xyz'
+  }
+};
+app.use(router);
+
+test('GET /api/config returns kibanaDashboards', async () => {
+  const res = await request(app).get('/api/config');
+  expect(res.status).toBe(200);
+  expect(res.body.kibanaDashboards.logs).toContain('logs.kb.example.com');
+  expect(res.body.kibanaDashboards.rum).toContain('rum.kb.example.com');
+});
+
+test('GET /api/config returns empty object when not configured', async () => {
+  const bare = express();
+  bare.config = {};
+  bare.use(router);
+  const res = await request(bare).get('/api/config');
+  expect(res.status).toBe(200);
+  expect(res.body.kibanaDashboards).toEqual({});
+});
+```
+
+- [ ] **Step 9: Wire middleware in gasket.js**
+
+Add a plugin hook that registers `requireSameOrigin` globally and `errorHandler` as the final handler. Also attach `gasket.config` to `app.config` so `routes/config.js` can read `kibanaDashboards`:
 
 ```js
 // Add to gasket.js plugins array:
 {
   name: 'cds-admin-global-middleware',
   hooks: {
+    express(gasket, app) {
+      // Expose gasket config on Express app so routes can read kibanaDashboards etc.
+      app.config = gasket.config;
+    },
     async middleware() {
       const { requireSameOrigin } = await import('./middleware/require-same-origin.js');
       return [requireSameOrigin];
@@ -744,17 +825,17 @@ Add a plugin hook that registers `requireSameOrigin` globally and `errorHandler`
 }
 ```
 
-- [ ] **Step 9: Run tests — expect PASS**
+- [ ] **Step 10: Run tests — expect PASS**
 
 ```bash
-npm test -- test/middleware test/lib
+npm test -- test/middleware test/lib test/routes/config.test.js
 ```
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add middleware/ lib/ routes/auth.js test/middleware/ test/lib/ gasket.js
-git commit -m "feat: jomax auth, allowlist, csrf, error handler"
+git add middleware/ lib/ routes/auth.js routes/config.js test/middleware/ test/lib/ test/routes/config.test.js gasket.js
+git commit -m "feat: jomax auth, allowlist, csrf, error handler, public config route"
 ```
 
 ---
@@ -2942,11 +3023,10 @@ export default function Analytics() {
   const [volume, setVolume] = useState({ buckets: [] });
   const [vitals, setVitals] = useState({ buckets: [] });
   const [loading, setLoading] = useState(false);
-
-  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
-  const rumBase  = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
+  const [kibanaDashboards, setKibanaDashboards] = useState({});
 
   useEffect(() => {
+    fetch('/api/config').then(r => r.json()).then(d => setKibanaDashboards(d.kibanaDashboards ?? {}));
     fetch('/api/components?env=prod').then(r => r.json())
       .then(items => {
         const names = items.map(c => c.name);
@@ -2986,7 +3066,7 @@ export default function Analytics() {
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
               <h3>Errors — {errors.total} total</h3>
-              {logsBase && <a href={kibanaLink(logsBase, `event.type:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+              {kibanaDashboards.logs && <a href={kibanaLink(kibanaDashboards.logs, `event.type:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
             </div>
             <ErrorsOverTime data={errors.buckets} />
           </div>
@@ -2997,7 +3077,7 @@ export default function Analytics() {
           <div style={{ gridColumn: '1 / -1' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
               <h3>Web Vitals (p75)</h3>
-              {rumBase && <a href={kibanaLink(rumBase, `customProps.media_library.componentType:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
+              {kibanaDashboards.rum && <a href={kibanaLink(kibanaDashboards.rum, `customProps.media_library.componentType:"${component}"`)} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#0070d2' }}>Open in Kibana →</a>}
             </div>
             <WebVitals data={vitals.buckets} />
           </div>
@@ -3160,6 +3240,11 @@ export default function RumPage() {
   const [editorValue, setEditorValue] = useState('');
   const [editorValid, setEditorValid] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [kibanaDashboards, setKibanaDashboards] = useState({});
+
+  useEffect(() => {
+    fetch('/api/config').then(r => r.json()).then(d => setKibanaDashboards(d.kibanaDashboards ?? {}));
+  }, []);
 
   useEffect(() => {
     if (!name) return;
@@ -3183,9 +3268,8 @@ export default function RumPage() {
     setSaving(false);
   }
 
-  const rumBase = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
-  const kibanaLink = rumBase && name
-    ? `${rumBase}&_a=${encodeURIComponent(`(query:(language:kuery,query:'customProps.media_library.componentType:"${name}"'))`)}`
+  const kibanaLink = kibanaDashboards.rum && name
+    ? `${kibanaDashboards.rum}&_a=${encodeURIComponent(`(query:(language:kuery,query:'customProps.media_library.componentType:"${name}"'))`)}`
     : null;
 
   return (
@@ -3281,6 +3365,11 @@ export default function LogsPage() {
   const [errors, setErrors] = useState({ total: 0, buckets: [] });
   const [volume, setVolume] = useState({ buckets: [] });
   const [deployedAt, setDeployedAt] = useState(null);
+  const [kibanaDashboards, setKibanaDashboards] = useState({});
+
+  useEffect(() => {
+    fetch('/api/config').then(r => r.json()).then(d => setKibanaDashboards(d.kibanaDashboards ?? {}));
+  }, []);
 
   // Load stored level once name is known
   useEffect(() => {
@@ -3306,9 +3395,8 @@ export default function LogsPage() {
     if (name) storeLevel(name, newLevel);
   }
 
-  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
-  const kibanaLink = logsBase && name
-    ? `${logsBase}&_a=${encodeURIComponent(`(query:(language:kuery,query:'event.type:"${name}"'))`)}`
+  const kibanaLink = kibanaDashboards.logs && name
+    ? `${kibanaDashboards.logs}&_a=${encodeURIComponent(`(query:(language:kuery,query:'event.type:"${name}"'))`)}`
     : null;
 
   return (
@@ -3378,7 +3466,7 @@ git commit -m "feat: logs sub-page with localStorage level filter and deployment
 
 - [ ] **Step 1: Add connect-gd-auth middleware to gasket.js**
 
-`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register it via an async plugin hook.
+`connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register it via an async plugin hook. `ssoRedirect` is built per-request so SSO sends the user back to the page they were trying to reach, not always `/`.
 
 ```js
 // Add to the TOP of gasket.js (alongside other imports):
@@ -3393,14 +3481,19 @@ const gdAuth = require('connect-gd-auth');
     async middleware(gasket) {
       const { auth = {} } = gasket.config;
       return [
-        gdAuth({
-          appName: 'cds-admin',
-          verify: gdAuth.risk.low,
-          types: ['jomax'],
-          auth: ['basic'],
-          host: auth.host,
-          ssoRedirect: auth.ssoRedirect
-        })
+        // Build ssoRedirect per-request so SSO bounces the user back to the
+        // exact page they were on (e.g. /components/myComp/logs) rather than /.
+        (req, res, next) => {
+          req._gdAuthOptions = {
+            appName: 'cds-admin',
+            verify: gdAuth.risk.low,
+            types: ['jomax'],
+            auth: ['basic'],
+            host: auth.host,
+            ssoRedirect: `${auth.ssoBase}/?realm=jomax&app=cds-admin&path=${encodeURIComponent(req.originalUrl)}`
+          };
+          gdAuth(req._gdAuthOptions)(req, res, next);
+        }
       ];
     }
   }
@@ -3467,6 +3560,12 @@ git commit -m "feat: connect-gd-auth SSO gate"
 ---
 
 ## Revision Notes
+
+**v5 changes:**
+
+- **Per-env Kibana dashboard URLs** — Removed `NEXT_PUBLIC_KIBANA_*` env vars (baked at build time). Kibana base URLs now live in `gasket.js` `environments` block as `kibanaDashboards: { logs, rum }`. Exposed to the client via `GET /api/config` (new `routes/config.js`). Pages fetch `/api/config` on mount and use `kibanaDashboards.logs/rum` state for Kibana deep-links.
+- **Dynamic SSO redirect path** — `ssoRedirect` no longer hardcodes `path=/`. Auth middleware now builds it per-request: `${auth.ssoBase}/?realm=jomax&app=cds-admin&path=${encodeURIComponent(req.originalUrl)}`. `gasket.js` environments now store `auth.ssoBase` (URL without path) instead of a full `ssoRedirect` string.
+- **ES API keys: local file vs. Katana secrets** — `.env.local.example` updated with explicit comments: locally, set `ELASTICSEARCH_LOGS_API_KEY` / `ELASTICSEARCH_RUM_API_KEY` in `.env.local`; in dev/test/prod, Katana injects them as env vars. The `clients/elasticsearch.js` code reads `process.env.*` in both cases.
 
 **v4 changes (tabbed multi-page architecture):**
 
@@ -4858,11 +4957,10 @@ export default function Analytics() {
   const [volume, setVolume] = useState({ buckets: [] });
   const [vitals, setVitals] = useState({ buckets: [] });
   const [loading, setLoading] = useState(false);
-
-  const logsBase = process.env.NEXT_PUBLIC_KIBANA_LOGS_DASHBOARD_URL;
-  const rumBase  = process.env.NEXT_PUBLIC_KIBANA_RUM_DASHBOARD_URL;
+  const [kibanaDashboards, setKibanaDashboards] = useState({});
 
   useEffect(() => {
+    fetch('/api/config').then(r => r.json()).then(d => setKibanaDashboards(d.kibanaDashboards ?? {}));
     fetch('/api/components?env=prod').then(r => r.json()).then(names => {
       setComponents(names);
       if (names.length) setComponent(names[0]);
@@ -4885,8 +4983,8 @@ export default function Analytics() {
     });
   }, [component, range]);
 
-  const logsLink = component ? kibanaLink(logsBase, `event.type:"${component}"`) : null;
-  const rumLink  = component ? kibanaLink(rumBase,  `customProps.media_library.componentType:"${component}"`) : null;
+  const logsLink = component ? kibanaLink(kibanaDashboards.logs, `event.type:"${component}"`) : null;
+  const rumLink  = component ? kibanaLink(kibanaDashboards.rum,  `customProps.media_library.componentType:"${component}"`) : null;
 
   return (
     <Layout>
@@ -5036,14 +5134,16 @@ const gdAuth = require('connect-gd-auth');
     async middleware(gasket) {
       const { auth = {} } = gasket.config;
       return [
-        gdAuth({
-          appName: 'cds-admin',
-          verify: gdAuth.risk.low,
-          types: ['jomax'],
-          auth: ['basic'],
-          host: auth.host,
-          ssoRedirect: auth.ssoRedirect
-        })
+        (req, res, next) => {
+          gdAuth({
+            appName: 'cds-admin',
+            verify: gdAuth.risk.low,
+            types: ['jomax'],
+            auth: ['basic'],
+            host: auth.host,
+            ssoRedirect: `${auth.ssoBase}/?realm=jomax&app=cds-admin&path=${encodeURIComponent(req.originalUrl)}`
+          })(req, res, next);
+        }
       ];
     }
   }
@@ -5054,9 +5154,9 @@ const gdAuth = require('connect-gd-auth');
 
 ```jsx
 // pages/_app.js
-// Relies on connect-gd-auth's Origin-Location or Referer handling on the server.
-// When /auth/me returns 401, we just reload — the server-side auth middleware
-// will redirect the browser to SSO (connect-gd-auth handles the redirect URL).
+// When /auth/me returns 401, we reload — the server-side connect-gd-auth middleware
+// redirects the browser to SSO with path= set to req.originalUrl so the user lands
+// back on the exact page they came from after authenticating.
 import { useEffect, useState } from 'react';
 
 export default function App({ Component, pageProps }) {
