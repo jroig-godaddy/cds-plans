@@ -2420,9 +2420,6 @@ export default function CdsAuthDocs() {
           <li>Jomax users — edit via the Auth tab in this tool</li>
           <li>Cert / AWS IAM — edit via Switchboard directly, or use the CDS CLI: <code>cds access add --cert &lt;identity&gt;</code></li>
         </ul>
-        <p>
-          Super-admins (listed in <code>cds-admin.admins.jomax</code>) bypass all per-component checks and can read/write any component in any environment.
-        </p>
       </div>
     </Layout>
   );
