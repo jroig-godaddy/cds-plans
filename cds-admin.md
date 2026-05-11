@@ -949,6 +949,36 @@ npm test -- test/middleware test/lib test/routes/config.test.js
 
 - [ ] **Step 11: Commit**
 
+
+- [ ] **Step 9: Write and run test for routes/config.js**
+
+```js
+// test/routes/config.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockConfig = {
+  kibanaDashboards: { logs: 'https://logs.kb.example', rum: 'https://rum.kb.example' },
+  kibanaDiscover: { logsUrl: 'https://logs.kb.example', logsDataViewId: 'abc123' }
+};
+jest.unstable_mockModule('../../gasket.js', () => ({ default: { config: mockConfig } }));
+const { default: configRouter } = await import('../../routes/config.js');
+
+const app = express();
+app.use(configRouter);
+
+test('GET /api/config returns kibanaDashboards and kibanaDiscover', async () => {
+  const res = await request(app).get('/api/config');
+  expect(res.status).toBe(200);
+  expect(res.body).toHaveProperty('kibanaDashboards.logs');
+  expect(res.body).toHaveProperty('kibanaDiscover.logsDataViewId');
+});
+```
+
+Run: `npm test -- test/routes/config.test.js`
+Expected: PASS
+
 ```bash
 git add middleware/ lib/ routes/auth.js routes/config.js test/middleware/ test/lib/ test/routes/config.test.js gasket.js
 git commit -m "feat: jomax auth, allowlist, csrf, error handler, public config route"
@@ -2253,6 +2283,109 @@ export default function ManifestPage() {
 
 - [ ] **Step 7: Verify in browser** — navigate to `/components/{name}/manifest`, edit JSON, confirm save and rollback work, i18n hash saves, Slack test fires.
 
+- [ ] **Step 6: Write and run tests for routes/i18n.js**
+
+```js
+// test/routes/i18n.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+const mockGetHistory = jest.fn();
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsClient: jest.fn().mockReturnValue({ get: mockGet, put: mockPut, getHistory: mockGetHistory })
+}));
+jest.unstable_mockModule('../../lib/access-control.js', () => ({
+  assertCanAccess: jest.fn().mockResolvedValue(undefined)
+}));
+const { default: i18nRouter } = await import('../../routes/i18n.js');
+const app = express();
+app.use(express.json());
+app.use((req, _, next) => { req.user = { accountName: 'jroig' }; next(); });
+app.use(i18nRouter);
+beforeEach(() => jest.clearAllMocks());
+
+test('GET returns value', async () => {
+  mockGet.mockResolvedValueOnce('607a011');
+  const res = await request(app).get('/api/components/myComp/i18n');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ value: '607a011' });
+});
+test('GET returns 404 when unset', async () => {
+  mockGet.mockResolvedValueOnce(null);
+  expect((await request(app).get('/api/components/myComp/i18n')).status).toBe(404);
+});
+test('PUT writes value', async () => {
+  mockPut.mockResolvedValueOnce(undefined);
+  const res = await request(app).put('/api/components/myComp/i18n').send({ value: '607a011' });
+  expect(res.status).toBe(200);
+  expect(mockPut).toHaveBeenCalledWith('registry.myComp.i18nVersion', '607a011');
+});
+test('GET history returns array', async () => {
+  mockGetHistory.mockResolvedValueOnce([{ value: 'abc' }]);
+  const res = await request(app).get('/api/components/myComp/i18n/history');
+  expect(Array.isArray(res.body)).toBe(true);
+});
+```
+
+Run: `npm test -- test/routes/i18n.test.js`
+Expected: PASS
+
+- [ ] **Step 7: Write and run tests for routes/alerts.js**
+
+```js
+// test/routes/alerts.test.js
+import { jest } from '@jest/globals';
+import request from 'supertest';
+import express from 'express';
+
+const mockGet = jest.fn();
+const mockPut = jest.fn();
+const mockSend = jest.fn().mockResolvedValue(undefined);
+jest.unstable_mockModule('../../clients/switchboard.js', () => ({
+  getCdsAdminClient: jest.fn().mockReturnValue({ get: mockGet, put: mockPut })
+}));
+jest.unstable_mockModule('../../lib/access-control.js', () => ({
+  assertCanAccess: jest.fn().mockResolvedValue(undefined)
+}));
+jest.unstable_mockModule('../../clients/slack.js', () => ({ sendSlackMessage: mockSend }));
+const { default: alertsRouter } = await import('../../routes/alerts.js');
+const app = express();
+app.use(express.json());
+app.use((req, _, next) => { req.user = { accountName: 'jroig' }; next(); });
+app.use(alertsRouter);
+beforeEach(() => jest.clearAllMocks());
+
+test('GET returns config', async () => {
+  mockGet.mockResolvedValueOnce({ slackWebhookUrl: 'https://hooks.slack.com/x' });
+  const res = await request(app).get('/api/alerts/myComp');
+  expect(res.body.slackWebhookUrl).toBe('https://hooks.slack.com/x');
+});
+test('GET returns null when unset', async () => {
+  mockGet.mockResolvedValueOnce(null);
+  expect((await request(app).get('/api/alerts/myComp')).body).toEqual({ slackWebhookUrl: null });
+});
+test('PUT saves config', async () => {
+  mockPut.mockResolvedValueOnce(undefined);
+  expect((await request(app).put('/api/alerts/myComp').send({ slackWebhookUrl: 'https://x' })).status).toBe(200);
+});
+test('POST /test fires Slack message', async () => {
+  mockGet.mockResolvedValueOnce({ slackWebhookUrl: 'https://hooks.slack.com/x' });
+  const res = await request(app).post('/api/alerts/myComp/test');
+  expect(res.status).toBe(200);
+  expect(mockSend).toHaveBeenCalledWith('https://hooks.slack.com/x', expect.stringContaining('myComp'));
+});
+test('POST /test returns 400 when no webhook', async () => {
+  mockGet.mockResolvedValueOnce({ slackWebhookUrl: null });
+  expect((await request(app).post('/api/alerts/myComp/test')).status).toBe(400);
+});
+```
+
+Run: `npm test -- test/routes/alerts.test.js`
+Expected: PASS
+
 - [ ] **Step 8: Commit**
 
 ```bash
@@ -3218,7 +3351,10 @@ router.get('/api/analytics/errors', requireJomax, async (req, res, next) => {
       total: result.hits.total.value,
       buckets: result.aggregations.over_time.buckets.map(b => ({ time: b.key_as_string, count: b.doc_count }))
     });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('[analytics] /errors failed:', err.message);
+    res.json({ buckets: [], degraded: true });
+  }
 });
 
 router.get('/api/analytics/volume', requireJomax, async (req, res, next) => {
@@ -3226,7 +3362,10 @@ router.get('/api/analytics/volume', requireJomax, async (req, res, next) => {
     const { component, from = 'now-1d', to = 'now' } = req.query;
     const result = await queryRequestVolume(component, from, to);
     res.json({ buckets: result.aggregations.over_time.buckets.map(b => ({ time: b.key_as_string, count: b.doc_count })) });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('[analytics] /volume failed:', err.message);
+    res.json({ buckets: [], degraded: true });
+  }
 });
 
 router.get('/api/analytics/vitals', requireJomax, async (req, res, next) => {
@@ -3241,7 +3380,10 @@ router.get('/api/analytics/vitals', requireJomax, async (req, res, next) => {
         inp_p75: b.inp_p75?.values?.['75.0'] ?? null
       }))
     });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('[analytics] /vitals failed:', err.message);
+    res.json({ buckets: [], degraded: true });
+  }
 });
 
 // Returns last 100 raw log entries. level param (default 'all') filters by log.level.
@@ -3260,7 +3402,10 @@ router.get('/api/analytics/logs', requireJomax, async (req, res, next) => {
       shopperId: h._source['client.user.id'] ?? null
     }));
     res.json({ entries });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('[analytics] /logs failed:', err.message);
+    res.json({ entries: [], degraded: true });
+  }
 });
 
 // Returns top shoppers (client.user.id) by error count.
@@ -3274,7 +3419,10 @@ router.get('/api/analytics/errors-by-user', requireJomax, async (req, res, next)
       count: b.doc_count
     }));
     res.json({ shoppers });
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('[analytics] /errors-by-user failed:', err.message);
+    res.json({ shoppers: [], degraded: true });
+  }
 });
 
 export default router;
@@ -3632,6 +3780,8 @@ export default function RumPage() {
       .then(cfg => { if (cfg) { setRumConfig(cfg); setEditorValue(JSON.stringify(cfg, null, 2)); } });
   }, [name, env]);
 
+> **ReferenceLine x-axis alignment**: `deployedAt` stores an ISO-8601 string from `metaData.updatedAt`. Recharts `ReferenceLine x={deployedAt}` renders only when `x` matches the exact format of the chart's x-axis values (`key_as_string` from ES). If the marker doesn't appear in testing, convert both to ms: store `new Date(m.metaData.updatedAt).getTime()` and add `type="number"` to `<XAxis>` with `tickFormatter={v => new Date(v).toLocaleTimeString()}`.
+
   useEffect(() => {
     if (!name) return;
     fetch(`/api/analytics/vitals?component=${name}&from=${range}&to=now`)
@@ -3716,6 +3866,55 @@ The `buildKibanaDiscoverUrl(kibanaDiscover, componentName, from, to)` helper bui
 
 Log level filter persists per-component in localStorage (`cds-admin:logLevel:{name}`), default `error`. Level change immediately refetches both chart data and raw entries. Time range picker (1h/6h/24h/7d) applies to charts; raw entries always show last 100 within the selected range.
 
+- [ ] **Step 0: Extract buildKibanaDiscoverUrl to lib/kibana.js**
+
+Move the inline helper so it can be unit-tested:
+
+```js
+// lib/kibana.js
+export function buildKibanaDiscoverUrl(kibanaDiscover, componentName, from, to) {
+  if (!kibanaDiscover?.logsUrl || !kibanaDiscover?.logsDataViewId) return null;
+  const { logsUrl, logsDataViewId } = kibanaDiscover;
+  const g = `(filters:!(),query:(language:kuery,query:''),refreshInterval:(pause:!t,value:60000),time:(from:${from},to:${to}))`;
+  const kql = encodeURIComponent('"' + componentName + '"');
+  const a = `(columns:!(),dataSource:(dataViewId:${logsDataViewId},type:dataView),filters:!(),hideChart:!f,interval:auto,query:(language:kuery,query:'event.type:${kql}'),sort:!(!('@timestamp',desc)))`;
+  return `${logsUrl}/app/discover#/?_g=${encodeURIComponent(g)}&_a=${encodeURIComponent(a)}`;
+}
+```
+
+In `pages/components/[name]/logs.js`, replace the inline `function buildKibanaDiscoverUrl(...)` block
+with: `import { buildKibanaDiscoverUrl } from '../../../lib/kibana.js';`
+
+- [ ] **Step 0b: Write and run test for buildKibanaDiscoverUrl**
+
+```js
+// test/lib/kibana.test.js
+import { buildKibanaDiscoverUrl } from '../../lib/kibana.js';
+
+const cfg = { logsUrl: 'https://kibana.example', logsDataViewId: 'abc123' };
+
+test('returns null when config is missing', () => {
+  expect(buildKibanaDiscoverUrl(null, 'myComp', 'now-1h', 'now')).toBeNull();
+  expect(buildKibanaDiscoverUrl({}, 'myComp', 'now-1h', 'now')).toBeNull();
+});
+test('returns a parseable URL', () => {
+  const url = buildKibanaDiscoverUrl(cfg, 'bamMediaManagerEsm', 'now-1h', 'now');
+  expect(() => new URL(url)).not.toThrow();
+  expect(url).toContain('https://kibana.example');
+});
+test('URL encodes the component name', () => {
+  const url = buildKibanaDiscoverUrl(cfg, 'bamMediaManagerEsm', 'now-1h', 'now');
+  expect(decodeURIComponent(url)).toContain('bamMediaManagerEsm');
+});
+test('URL contains the data view ID', () => {
+  const url = buildKibanaDiscoverUrl(cfg, 'myComp', 'now-1h', 'now');
+  expect(decodeURIComponent(url)).toContain('abc123');
+});
+```
+
+Run: `npm test -- test/lib/kibana.test.js`
+Expected: PASS
+
 - [ ] **Step 1: Create pages/components/[name]/logs.js**
 
 ```jsx
@@ -3787,6 +3986,8 @@ export default function LogsPage() {
     fetch(`/api/components/${name}?env=${env}`).then(r => r.json())
       .then(m => setDeployedAt(m?.metaData?.updatedAt ?? null));
   }, [name, env]);
+
+> **ReferenceLine x-axis alignment**: `deployedAt` stores an ISO-8601 string from `metaData.updatedAt`. Recharts `ReferenceLine x={deployedAt}` renders only when `x` matches the exact format of the chart's x-axis values (`key_as_string` from ES). If the marker doesn't appear in testing, convert both to ms: store `new Date(m.metaData.updatedAt).getTime()` and add `type="number"` to `<XAxis>` with `tickFormatter={v => new Date(v).toLocaleTimeString()}`.
 
   // Fetch charts + raw logs + shoppers whenever name/range/level changes
   useEffect(() => {
@@ -4126,4 +4327,5 @@ git commit -m "feat: connect-gd-auth SSO gate"
 - **Request volume ES query fixed** — now uses `message.keyword` regex that matches component name in any position within the `componentTypes=foo,bar,baz` list.
 - **Analytics decoupled from component detail** — removed as a tab; replaced with an `Analytics →` link to `/analytics?component={name}`.
 - **Next.js imports** — dropped `.js` extensions from `next/router`, `next/dynamic`.
+
 
