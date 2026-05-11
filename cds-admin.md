@@ -48,6 +48,31 @@ This tool is a web app for CDS component owners. It lives at `cds-admin.int.{env
 
 ---
 
+## @ux/* Component Library Reference
+
+All UI must use `@ux/*` components — no plain HTML buttons, inputs, or tables. Key mappings:
+
+| HTML element | @ux/* component | Import |
+|---|---|---|
+| `<button>` | `<Button>` | `@ux/button` |
+| `<table>` | `<Table columns rows>` | `@ux/table` |
+| `<input type="text">` | `<TextInput>` | `@ux/text-input` |
+| `<div class="modal">` | `<Modal>` | `@ux/modal` |
+| loading spinner | `<Spinner>` | `@ux/spinner` |
+| error/success banner | `<Alert type="error|success">` | `@ux/alert` |
+| toast notification | `<Growl>` | `@ux/growl` |
+| `<span class="badge">` | `<Badge>` | `@ux/badge` |
+| nav tabs | `<Tabs><Tab>` | `@ux/tabs` |
+| `<p>`, `<h*>` | `<Text>` | `@ux/text` |
+| `<svg>` icon | `<Icon name="...">` | `@ux/icon` |
+| layout box | `<Box>` | `@ux/box` |
+
+All are already in `package.json`. Import pattern: `import Button from '@ux/button'`.
+
+---
+
+---
+
 ## File Structure
 
 ```
@@ -154,7 +179,7 @@ The app reads from two separate Elasticsearch clusters. Both are **read-only** f
 
 ### Logs cluster — `.ds-cds-api-prod-logs-*`
 
-**Connection:** `ELASTICSEARCH_LOGS_URL` + `ELASTICSEARCH_LOGS_API_KEY`
+**Connection:** `ELASTICSEARCH_URL` + `ELASTICSEARCH_API_KEY`
 
 Captures every CDS API call and error. Written by `cds-loader` when components are loaded on consumer pages.
 
@@ -193,7 +218,7 @@ Captures every CDS API call and error. Written by `cds-loader` when components a
 
 ### RUM cluster — `sns-traffic-c1-prod*`
 
-**Connection:** `ELASTICSEARCH_RUM_URL` + `ELASTICSEARCH_RUM_API_KEY`
+**Connection:** `RUM_ELASTICSEARCH_URL` + `RUM_ELASTICSEARCH_API_KEY`
 
 Captures Core Web Vitals measurements from real users. Written by the RUM poller that runs alongside each component on the page.
 
@@ -370,12 +395,12 @@ GASKET_ENV=local
 # DEV/TEST/PROD: injected automatically by Katana secrets — no file needed
 
 # Logs cluster — errors + request volume (.ds-cds-api-prod-logs-*)
-ELASTICSEARCH_LOGS_URL=https://<logs-cluster>.es.us-west-2.aws.found.io:9243
-ELASTICSEARCH_LOGS_API_KEY=
+ELASTICSEARCH_URL=https://<logs-cluster>.es.us-west-2.aws.found.io:9243
+ELASTICSEARCH_API_KEY=
 
 # RUM cluster — web vitals (sns-traffic-c1-prod*)
-ELASTICSEARCH_RUM_URL=https://<rum-cluster>.es.us-west-2.aws.found.io:9243
-ELASTICSEARCH_RUM_API_KEY=
+RUM_ELASTICSEARCH_URL=https://<rum-cluster>.es.us-west-2.aws.found.io:9243
+RUM_ELASTICSEARCH_API_KEY=
 
 # ── Other ──────────────────────────────────────────────────────────────────────
 SESSION_SECRET=dev-secret-change-in-prod
@@ -2977,6 +3002,12 @@ git commit -m "feat: sync API + sync sub-page"
 
 ## Task 14: Elasticsearch Client (with Log Level Filter)
 
+> **⚠ Replace existing stub**: The scaffold already has a `clients/elasticsearch.js` with
+> incompatible env var names and wrong field names (`componentType` instead of `event.type`,
+> `level` instead of `log.level`). This task **completely rewrites** that file — do not try
+> to build on the existing stub.
+
+
 **Files:**
 - Create: `clients/elasticsearch.js`
 - Create: `test/clients/elasticsearch.test.js`
@@ -2998,10 +3029,10 @@ jest.unstable_mockModule('@elastic/elasticsearch', () => ({
   }))
 }));
 
-process.env.ELASTICSEARCH_LOGS_URL = 'https://logs.example.com';
-process.env.ELASTICSEARCH_LOGS_API_KEY = 'bG9nczp0ZXN0';
-process.env.ELASTICSEARCH_RUM_URL = 'https://rum.example.com';
-process.env.ELASTICSEARCH_RUM_API_KEY = 'cnVtOnRlc3Q=';
+process.env.ELASTICSEARCH_URL = 'https://logs.example.com';
+process.env.ELASTICSEARCH_API_KEY = 'bG9nczp0ZXN0';
+process.env.RUM_ELASTICSEARCH_URL = 'https://rum.example.com';
+process.env.RUM_ELASTICSEARCH_API_KEY = 'cnVtOnRlc3Q=';
 
 const { getLogsClient, getRumClient, queryErrors, queryRequestVolume, queryWebVitals, queryRawLogs, queryErrorsByUser } = await import('../../clients/elasticsearch.js');
 
@@ -3088,8 +3119,8 @@ let rumClient;
 export function getLogsClient() {
   if (!logsClient) {
     logsClient = new Client({
-      node: process.env.ELASTICSEARCH_LOGS_URL,
-      auth: { apiKey: process.env.ELASTICSEARCH_LOGS_API_KEY }
+      node: process.env.ELASTICSEARCH_URL,
+      auth: { apiKey: process.env.ELASTICSEARCH_API_KEY }
     });
   }
   return logsClient;
@@ -3098,8 +3129,8 @@ export function getLogsClient() {
 export function getRumClient() {
   if (!rumClient) {
     rumClient = new Client({
-      node: process.env.ELASTICSEARCH_RUM_URL,
-      auth: { apiKey: process.env.ELASTICSEARCH_RUM_API_KEY }
+      node: process.env.RUM_ELASTICSEARCH_URL,
+      auth: { apiKey: process.env.RUM_ELASTICSEARCH_API_KEY }
     });
   }
   return rumClient;
@@ -4172,6 +4203,15 @@ git commit -m "feat: logs sub-page with raw entries table, shopper breakdown, Ki
 - Modify: `pages/_app.js`
 - Modify: `gasket.js` (add express middleware)
 
+- [ ] **Step 0: Install connect-gd-auth**
+
+```bash
+npm install connect-gd-auth
+```
+
+`connect-gd-auth` is not in `package.json` yet. It is a GoDaddy internal CJS module available
+on the internal npm registry.
+
 - [ ] **Step 1: Add connect-gd-auth middleware to gasket.js**
 
 `connect-gd-auth` is CJS-only, so we use `createRequire` at the top of `gasket.js` and register it via an async plugin hook. `ssoRedirect` is built per-request so SSO sends the user back to the page they were trying to reach, not always `/`.
@@ -4327,5 +4367,6 @@ git commit -m "feat: connect-gd-auth SSO gate"
 - **Request volume ES query fixed** — now uses `message.keyword` regex that matches component name in any position within the `componentTypes=foo,bar,baz` list.
 - **Analytics decoupled from component detail** — removed as a tab; replaced with an `Analytics →` link to `/analytics?component={name}`.
 - **Next.js imports** — dropped `.js` extensions from `next/router`, `next/dynamic`.
+
 
 
